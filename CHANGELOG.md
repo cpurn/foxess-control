@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Grid import/export swapped while an EV charges on the house side of the inverter.** The WS grid direction fell back to `gridStatus == "3"` whenever the power balance diverged >3x from the measured grid power. An EV reported in the separate `charger` node (or an unmeasured load of 4-8 kW) pushed the ratio across 3x, and on firmware where `gridStatus` 2 means import the fallback reported export (`sensor.foxess_grid_consumption` 0, feed-in = import, HA Home node 0 W). Direction now uses the signed `gridToHidden` flag, then the balance including `charger` power, then a learned `gridStatus` meaning, then the previous direction (C-006, D-010). Regression classes `tests/test_realtime_ws.py::TestGridDirectionEvCharger` and `::TestGridDirectionTracker`.
+
 ## 1.0.21
 
 Consolidates the 1.0.21-beta.1 … beta.4 pre-releases. Headline: a series of
