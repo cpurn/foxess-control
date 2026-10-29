@@ -158,6 +158,12 @@ class InverterModel:
     # WS config overrides
     ws_unit: str = "W"  # "W" or "kW"
     ws_time_diff: int = 5  # normal
+    # Seconds between WS pushes (5 on the real cloud; tests shrink it).
+    ws_push_interval_s: float = 5.0
+    # Real cloud behaviour (live 2026-10-29): the data stream ends ~300 s
+    # after each connect - the socket stays open but frames stop.  >0 makes
+    # every client go silent this many seconds after IT connected; 0 = off.
+    ws_stream_cutoff_s: float = 0.0
 
     # Autonomous rate limiting (per-endpoint, seconds between requests)
     # Default 0 = disabled, so existing tests are unaffected.
@@ -482,6 +488,8 @@ class InverterModel:
             "api_key": self.api_key,
             "ws_unit": self.ws_unit,
             "ws_time_diff": self.ws_time_diff,
+            "ws_push_interval_s": self.ws_push_interval_s,
+            "ws_stream_cutoff_s": self.ws_stream_cutoff_s,
             "feedin_total_kwh": round(self.feedin_total_kwh, 3),
             "grid_consumption_total_kwh": round(self.grid_consumption_total_kwh, 3),
             "rate_limit_seconds": self.rate_limit_seconds,

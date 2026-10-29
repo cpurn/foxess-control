@@ -189,6 +189,9 @@ charge/discharge scenarios through containerised HA + simulator
 | `TestGridDirectionEvCharger::*` | Live 2026-10-27 EV samples: charger node, signed `gridToHidden`, 48x divergence, export sample | C-006 |
 | `TestGridDirectionTracker::*` | Variable 4-8 kW unmeasured load, ~3x ratio, hold, learned gridStatus, GH #3 | C-006 |
 | `TestStaleness::test_stale_messages_skipped` | timeDiff > 30 filtered | C-005 |
+| `TestOverlapReconnect::*` (14 tests) | Overlap reconnect (fake sockets): fires at the interval and not before, seamless swap (no `on_disconnect`, no WARNING, no lost frame), old socket quiet/stale/closed during handover is not an error, silent or failing new socket is dropped and retried, `async_disconnect`/`request_stop`/`_stop_event` leave no tasks or sockets, tracker survives the swap | C-005, C-020 |
+| `TestStreamCutAtFixedAge::*` (2 tests) | Stream cut at a fixed age: no data gap with overlap reconnect; baseline without it shows the old 30 s gap | C-005, C-020 |
+| `test_overlap_reconnect_against_the_simulator` | Real sockets against the simulator's `ws_stream_cutoff_s` mode, newest-client-wins | C-005, C-020 |
 | `TestIsPlausible::*` (11 tests) | >10x divergence filter | C-004 |
 | `TestWsPlausibilityFilter::*` (3 tests) | Plausibility in WS listen loop | C-004 |
 

@@ -285,6 +285,15 @@ class FoxESSRealtimeWS:
     RECONNECT_MAX_DELAY = 60.0
     STALE_TIMEOUT = 30.0  # no message in this many seconds = dead
     MAX_TIME_DIFF = 30  # skip messages older than this (seconds)
+    # Overlap reconnect.  The cloud ends the data stream ~300 s after every
+    # connect (socket stays open, frames just stop - measured live
+    # 2026-10-29; re-sending "getdata" does not extend it).  So ~270 s after
+    # connect a SECOND socket is opened alongside the live one and, once it
+    # delivers its first accepted frame, becomes the live socket.  The data
+    # never goes silent and ``on_disconnect`` is not called.  0 disables.
+    PROACTIVE_RECONNECT_AFTER = 270.0
+    HANDOVER_TIMEOUT = 15.0  # new socket must deliver a frame within this
+    HANDOVER_RETRY_BACKOFF = 10.0  # between failed handover attempts
 
     def __init__(
         self,
@@ -318,6 +327,17 @@ class FoxESSRealtimeWS:
         self._http_session: aiohttp.ClientSession | None = None
         self._listen_task: asyncio.Task[None] | None = None
         self._connected = False
+        # Overlap-reconnect state (see ``PROACTIVE_RECONNECT_AFTER``).
+        # ``_handover_task`` is the per-connection timer/driver, at most one
+        # attempt runs at a time, ``_pending_ws`` is the half-open second
+        # socket while an attempt is in flight and ``_handover_settled`` is
+        # set whenever no attempt is in flight.
+        self._handover_task: asyncio.Task[None] | None = None
+        self._pending_ws: aiohttp.ClientWebSocketResponse | None = None
+        self._handover_active = False
+        self._handover_settled = asyncio.Event()
+        self._handover_settled.set()
+        self._connected_at: float = asyncio.get_event_loop().time()
         self._stop_event = asyncio.Event()
         # Set by ``request_stop`` to prevent ``_try_reconnect`` from
         # re-establishing the connection once a shutdown has been
@@ -370,8 +390,8 @@ class FoxESSRealtimeWS:
         """
         self._no_reconnect = True
 
-    async def _do_connect(self, token: str) -> None:
-        """Establish the WebSocket connection."""
+    async def _open_socket(self, token: str) -> aiohttp.ClientWebSocketResponse:
+        """Open a ``wsmaitian`` socket for this plant and send ``getdata``."""
         if self._http_session is None or self._http_session.closed:
             self._http_session = aiohttp.ClientSession()
         encoded_token = quote(token, safe="")
@@ -379,26 +399,251 @@ class FoxESSRealtimeWS:
             f"{self.WS_URL}?plantId={self._plant_id}"
             f"&token={encoded_token}&platform=web&lang=en"
         )
-        self._ws = await self._http_session.ws_connect(
+        ws = await self._http_session.ws_connect(
             url,
             heartbeat=20.0,
             timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
         )
-        await self._ws.send_str("getdata")
+        try:
+            await ws.send_str("getdata")
+        except BaseException:
+            await self._close_socket(ws)
+            raise
+        return ws
+
+    async def _do_connect(self, token: str) -> None:
+        """Establish the WebSocket connection."""
+        self._ws = await self._open_socket(token)
         self._last_accepted = None
         self._connected = True
-        self._last_useful_data = asyncio.get_event_loop().time()
+        now = asyncio.get_event_loop().time()
+        self._last_useful_data = now
+        self._connected_at = now
+        self._start_handover_timer()
         _LOGGER.info("FoxESS WebSocket connected (plant=%s)", self._plant_id)
+
+    @staticmethod
+    async def _close_socket(ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Close *ws*, bounded, ignoring errors."""
+        if ws.closed:
+            return
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(5.0):
+                await ws.close()
+
+    # -- overlap reconnect ------------------------------------------------
+
+    def _start_handover_timer(self) -> None:
+        """(Re)start the per-connection overlap-reconnect driver."""
+        task = self._handover_task
+        self._handover_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        if self.PROACTIVE_RECONNECT_AFTER > 0:
+            self._handover_task = asyncio.ensure_future(self._handover_loop())
+
+    async def _stop_handover(self) -> None:
+        """Cancel the driver and close any half-open second socket."""
+        task = self._handover_task
+        self._handover_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        pending = self._pending_ws
+        self._pending_ws = None
+        if pending is not None:
+            await self._close_socket(pending)
+        self._handover_active = False
+        self._handover_settled.set()
+
+    def _handover_ready(self) -> bool:
+        """True if the live socket is healthy enough to hand over from."""
+        ws = self._ws
+        if not self._connected or ws is None or ws.closed:
+            return False
+        idle = asyncio.get_event_loop().time() - self._last_useful_data
+        if idle >= self.STALE_TIMEOUT:
+            return False  # already dying: the normal reconnect path owns it
+        return self.should_reconnect is None or self.should_reconnect()
+
+    async def _handover_loop(self) -> None:
+        """Hand over to a fresh socket ``PROACTIVE_RECONNECT_AFTER`` s after connect."""
+        loop = asyncio.get_event_loop()
+        failures = 0
+        while not (self._stop_event.is_set() or self._no_reconnect):
+            wait = self._connected_at + self.PROACTIVE_RECONNECT_AFTER - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            if not self._handover_ready():
+                await asyncio.sleep(self.HANDOVER_RETRY_BACKOFF)
+                continue
+            if await self._handover_once():
+                failures = 0
+                continue
+            failures += 1
+            if failures == 3:
+                _LOGGER.warning(
+                    "FoxESS WebSocket: overlap reconnect failed %d times in a "
+                    "row; the live connection will be replaced the normal way "
+                    "if the stream stops",
+                    failures,
+                )
+            await asyncio.sleep(self.HANDOVER_RETRY_BACKOFF)
+
+    async def _handover_once(self) -> bool:
+        """Open a second socket and swap to it on its first accepted frame.
+
+        The live socket keeps delivering meanwhile.  Returns True on swap.
+        Never calls ``on_disconnect`` and never touches ``_connected``.
+        """
+        loop = asyncio.get_event_loop()
+        self._handover_active = True
+        self._handover_settled.clear()
+        new_ws: aiohttp.ClientWebSocketResponse | None = None
+        old_ws: aiohttp.ClientWebSocketResponse | None = None
+        try:
+            _LOGGER.info("FoxESS WebSocket overlap reconnect: handover started")
+            async with asyncio.timeout(self.HANDOVER_TIMEOUT):
+                token = await self._web_session.async_ensure_token()
+                opened_at = loop.time()
+                new_ws = await self._open_socket(token)
+                self._pending_ws = new_ws
+                accepted = await self._first_accepted_frame(new_ws)
+            if not accepted:
+                return False  # shutdown requested while waiting
+            # Swap (no await between here and the flag reset: atomic for the
+            # listen loop).  Frames of the new socket are already delivered.
+            old_ws = self._ws
+            self._ws = new_ws
+            self._pending_ws = None
+            self._connected_at = opened_at
+            new_ws = None
+            _LOGGER.info(
+                "FoxESS WebSocket overlap reconnect: handover complete "
+                "(new socket live after %.1fs)",
+                loop.time() - opened_at,
+            )
+            return True
+        except TimeoutError:
+            _LOGGER.info(
+                "FoxESS WebSocket overlap reconnect: new socket gave no accepted "
+                "frame within %.0fs - keeping the current connection",
+                self.HANDOVER_TIMEOUT,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            _LOGGER.info(
+                "FoxESS WebSocket overlap reconnect: handover failed (%s) - "
+                "keeping the current connection",
+                err,
+            )
+            _LOGGER.debug("Handover failure detail", exc_info=True)
+            return False
+        finally:
+            self._handover_active = False
+            self._handover_settled.set()
+            if new_ws is not None:
+                self._pending_ws = None
+                await self._close_socket(new_ws)
+            if old_ws is not None:
+                # Waking the listen loop's pending receive() on the old
+                # socket; it sees ``ws is not self._ws`` and moves on.
+                await self._close_socket(old_ws)
+
+    async def _first_accepted_frame(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """Read *ws* until a frame is accepted and delivered; False on shutdown."""
+        while True:
+            msg = await ws.receive()
+            if msg.type in (
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.ERROR,
+            ):
+                raise ConnectionError("new socket closed during handover")
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            data = self._decode_frame(msg)
+            if data is None or self._is_stale_frame(data):
+                continue
+            if self._stop_event.is_set() or self._no_reconnect:
+                return False
+            if await self._deliver_frame(data):
+                return True
+
+    async def _superseded(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """True if *ws* was replaced by a handover (waits for one in flight).
+
+        The listen loop calls this before treating a timeout, close or error
+        on *ws* as a dead connection: during an overlap reconnect the old
+        socket going quiet or closing is expected.
+        """
+        if ws is self._ws and self._handover_active:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._handover_settled.wait(), self.HANDOVER_TIMEOUT + 5.0
+                )
+        return ws is not self._ws
+
+    # -- frame handling ---------------------------------------------------
+
+    @staticmethod
+    def _decode_frame(msg: aiohttp.WSMessage) -> dict[str, Any] | None:
+        """Decode a TEXT frame; None for non-JSON or an error message."""
+        try:
+            data = msg.json()
+        except ValueError:
+            _LOGGER.debug("FoxESS WebSocket: ignoring non-JSON message")
+            return None
+        if data.get("errno", 0) != 0:
+            _LOGGER.debug("FoxESS WebSocket error message: %s", data.get("msg"))
+            return None
+        return data  # type: ignore[no-any-return]
+
+    def _is_stale_frame(self, data: dict[str, Any]) -> bool:
+        """True (and logged) if the frame's ``timeDiff`` marks it as stale."""
+        time_diff = data.get("result", {}).get("timeDiff")
+        if isinstance(time_diff, int | float) and time_diff > self.MAX_TIME_DIFF:
+            _LOGGER.debug(
+                "FoxESS WebSocket: skipping stale message (timeDiff=%s)",
+                time_diff,
+            )
+            return True
+        return False
+
+    async def _deliver_frame(self, data: dict[str, Any]) -> bool:
+        """Map, plausibility-check and forward a fresh frame; True if accepted."""
+        mapped = map_ws_to_coordinator(data, self._grid_direction)
+        if not mapped:
+            return False
+        if not _is_plausible(mapped, self._last_accepted):
+            return False
+        self._last_accepted = mapped
+        self._last_useful_data = asyncio.get_event_loop().time()
+        try:
+            await self._on_data(mapped)
+        except Exception:
+            _LOGGER.debug("Error in WebSocket data callback", exc_info=True)
+        return True
 
     async def _listen_loop(self) -> None:
         """Receive messages, reconnect on failure."""
         while not self._stop_event.is_set():
+            # The socket read here may be swapped out by an overlap
+            # reconnect while receive() is pending; anything it then
+            # returns or raises belongs to the old socket and is ignored.
+            ws = self._ws
             try:
                 msg = await asyncio.wait_for(
-                    self._ws.receive(),  # type: ignore[union-attr]
+                    ws.receive(),  # type: ignore[union-attr]
                     timeout=self.STALE_TIMEOUT,
                 )
             except TimeoutError:
+                if await self._superseded(ws):  # type: ignore[arg-type]
+                    continue
                 _LOGGER.warning(
                     "FoxESS WebSocket stale (no data in %.0fs)",
                     self.STALE_TIMEOUT,
@@ -408,13 +653,20 @@ class FoxESSRealtimeWS:
                     break
                 continue
             except Exception:
+                if await self._superseded(ws):  # type: ignore[arg-type]
+                    continue
                 _LOGGER.debug("FoxESS WebSocket receive error", exc_info=True)
                 await self._try_reconnect()
                 if not self._connected:
                     break
                 continue
 
+            if ws is not self._ws:
+                continue  # frame from a socket that was just replaced
+
             if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                if await self._superseded(ws):  # type: ignore[arg-type]
+                    continue
                 _LOGGER.info("FoxESS WebSocket closed by server")
                 await self._try_reconnect()
                 if not self._connected:
@@ -422,6 +674,8 @@ class FoxESSRealtimeWS:
                 continue
 
             if msg.type == aiohttp.WSMsgType.ERROR:
+                if await self._superseded(ws):  # type: ignore[arg-type]
+                    continue
                 _LOGGER.warning("FoxESS WebSocket error: %s", msg.data)
                 await self._try_reconnect()
                 if not self._connected:
@@ -431,31 +685,22 @@ class FoxESSRealtimeWS:
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
 
-            try:
-                data = msg.json()
-            except ValueError:
-                _LOGGER.debug("FoxESS WebSocket: ignoring non-JSON message")
+            data = self._decode_frame(msg)
+            if data is None:
                 continue
 
-            if data.get("errno", 0) != 0:
-                _LOGGER.debug("FoxESS WebSocket error message: %s", data.get("msg"))
-                continue
-
-            # Skip stale messages — timeDiff is seconds since the
+            # Skip stale messages - timeDiff is seconds since the
             # inverter last reported.  The first message after connect is
-            # typically 30-200+ seconds old; fresh updates have timeDiff ≈ 5.
-            time_diff = data.get("result", {}).get("timeDiff")
-            if isinstance(time_diff, int | float) and time_diff > self.MAX_TIME_DIFF:
-                _LOGGER.debug(
-                    "FoxESS WebSocket: skipping stale message (timeDiff=%s)",
-                    time_diff,
-                )
+            # typically 30-200+ seconds old; fresh updates have timeDiff ~ 5.
+            if self._is_stale_frame(data):
                 # Check if we've gone too long without useful data.
                 # Stale keepalive frames from the cloud (e.g. after
                 # another client steals the stream) reset receive()
                 # but carry no useful data.
                 now = asyncio.get_event_loop().time()
                 if now - self._last_useful_data > self.STALE_TIMEOUT:
+                    if await self._superseded(ws):  # type: ignore[arg-type]
+                        continue
                     _LOGGER.warning(
                         "FoxESS WebSocket: no useful data in %.0fs "
                         "(only stale frames), reconnecting",
@@ -466,16 +711,7 @@ class FoxESSRealtimeWS:
                         break
                 continue
 
-            mapped = map_ws_to_coordinator(data, self._grid_direction)
-            if mapped:
-                if not _is_plausible(mapped, self._last_accepted):
-                    continue
-                self._last_accepted = mapped
-                self._last_useful_data = asyncio.get_event_loop().time()
-                try:
-                    await self._on_data(mapped)
-                except Exception:
-                    _LOGGER.debug("Error in WebSocket data callback", exc_info=True)
+            await self._deliver_frame(data)
 
         # Loop exited — signal disconnection
         self._connected = False
@@ -569,6 +805,7 @@ class FoxESSRealtimeWS:
 
     async def _close_ws(self) -> None:
         """Close the WebSocket connection if open."""
+        await self._stop_handover()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None

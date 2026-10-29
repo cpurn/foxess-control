@@ -439,6 +439,53 @@ never learns that `pvPower` may include an external term.
 **Traces**: C-035, C-021, C-039, C-020, C-026; D-010 (grid-direction
 balance the external term improves).
 
+### D-062: Overlap reconnect before the cloud ends the stream
+**Decision**: ~270 s (`PROACTIVE_RECONNECT_AFTER`) after each connect,
+`FoxESSRealtimeWS` opens a **second** socket with the same token and
+plant, sends `getdata`, keeps the live socket delivering, and swaps to
+the new socket on its **first accepted frame** (`timeDiff <= 30`, passes
+the plausibility check). The old socket is then closed. A successful
+handover never calls `on_disconnect`, never changes `_connected`, drops no
+frame and logs only at INFO. Only one handover runs at a time; if the new
+socket is silent for `HANDOVER_TIMEOUT` (15 s) or fails to connect it is
+closed and the attempt retried after `HANDOVER_RETRY_BACKOFF` (10 s) while
+the live socket is still healthy. While a handover is in flight a
+timeout, close, error or stale-only stream on the *old* socket is not
+treated as a dead connection (newest client wins: the old socket goes
+quiet at once); if the handover itself fails, the existing
+`_try_reconnect` path runs unchanged. `request_stop`, `_stop_event` and
+`async_disconnect` cancel the timer and close a half-open second socket.
+The `GridDirectionTracker` and `_last_useful_data` are per
+`FoxESSRealtimeWS` and survive the swap.
+**Context**: Measured live 2026-10-29 on `ws_mode: always`: the cloud stops
+sending frames ~298 s after every connect (the socket stays open and keeps
+answering heartbeats). The 30 s silence check (C-005) then fires, the
+badge flips to `api`, and the reconnect 5-8 s later restores `ws` - one
+`ws -> api -> ws` cycle every 5 min 36 s, ~40 s of frozen or REST-only data
+each. Re-sending `getdata` every 60 s on the open socket was tried and did
+**not** extend the stream, so the limit is on the connection, not the
+subscription.
+**Rationale**: Opening the replacement *before* the cut makes the stream
+continuous: the new socket's first accepted frame arrives while the old one
+still delivers. Swapping on the first accepted frame (not on connect)
+guarantees the replacement actually carries data. Reusing the cached web
+token avoids a second login that might invalidate the first session.
+**Priority served**: P-005 (Operational transparency)
+**Trades against**: none
+**Classification**: other
+**Alternatives considered**:
+- Re-send `getdata` periodically: tried live, did not extend the stream.
+- Shorten the 30 s silence check: only shrinks the gap, and ~5 s frame
+  jitter leaves little margin; C-005 documents 30 s.
+- Hold the `ws` badge for a grace period: hides the flip but not the
+  frozen data (against C-020).
+- Close the old socket first and reconnect: the original behaviour, ~40 s
+  gap every cycle.
+**Traces**: C-005, C-020;
+`tests/test_realtime_ws.py::TestOverlapReconnect`,
+`tests/test_realtime_ws.py::TestStreamCutAtFixedAge`,
+`tests/test_realtime_ws.py::test_overlap_reconnect_against_the_simulator`
+
 ## Key Behaviours
 
 - WebSocket requires web portal credentials (username + MD5(password)),
