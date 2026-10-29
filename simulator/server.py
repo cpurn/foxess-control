@@ -314,6 +314,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     # if the server doesn't respond, aiohttp may close the connection.
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+    ws["connected_at"] = asyncio.get_running_loop().time()
     ws_clients.append(ws)
     _LOGGER.info(
         "WebSocket connected (clients=%d, active=newest only)",
@@ -354,19 +355,27 @@ async def _ws_push_loop(app: web.Application) -> None:
     the client's receive() from timing out but carry no useful data.
     This replicates FoxESS cloud behaviour where a new web/app login
     takes over the stream but the old connection stays alive.
+
+    With ``model.ws_stream_cutoff_s`` > 0 every client additionally goes
+    completely silent that many seconds after it connected (socket open,
+    no frames - what the real cloud does ~300 s after each connect).
     """
     model: InverterModel = app["model"]
     ws_clients: list[web.WebSocketResponse] = app["ws_clients"]
     try:
+        loop = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(model.ws_push_interval_s)
             if not ws_clients or model.active_fault == "ws_disconnect":
                 continue
             msg = json.dumps(model.get_ws_message())
             stale_msg = json.dumps({"errno": 0, "result": {"timeDiff": 999}})
+            cutoff = model.ws_stream_cutoff_s
             for i, ws in enumerate(list(ws_clients)):
                 if ws.closed:
                     continue
+                if cutoff > 0 and loop.time() - ws.get("connected_at", 0.0) >= cutoff:
+                    continue  # stream ended for this connection
                 try:
                     if i == len(ws_clients) - 1:
                         await ws.send_str(msg)

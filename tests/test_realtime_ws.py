@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-from typing import TYPE_CHECKING
+import itertools
+import json
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -11,6 +14,8 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from .conftest import SimulatorHandle
 
 from custom_components.foxess_control.foxess.realtime_ws import (
     FoxESSRealtimeWS,
@@ -1165,3 +1170,524 @@ class TestReconnectRespectsGate:
             await ws._try_reconnect()
 
         assert connect_attempts["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Overlap reconnect: hand over to a second socket before the cloud cuts the
+# stream (~300 s after connect, socket stays open but silent)
+# ---------------------------------------------------------------------------
+
+
+_CLOSED_MSG = aiohttp.WSMessage(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None)
+
+
+def _text_frame(time_diff: int = 5, soc: int = 65) -> aiohttp.WSMessage:
+    return TestStaleness._make_ws_msg(time_diff=time_diff, soc=soc)
+
+
+class _QueueSocket:
+    """Fake ``ClientWebSocketResponse``: ``receive()`` pops a queue.
+
+    Like aiohttp, ``close()`` wakes a pending ``receive()`` with CLOSED.
+    """
+
+    def __init__(self, name: str = "sock") -> None:
+        self.name = name
+        self.closed = False
+        self.sent: list[str] = []
+        self._queue: asyncio.Queue[aiohttp.WSMessage] = asyncio.Queue()
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def receive(self) -> aiohttp.WSMessage:
+        return await self._queue.get()
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._queue.put_nowait(_CLOSED_MSG)
+
+    def feed(self, msg: aiohttp.WSMessage) -> None:
+        self._queue.put_nowait(msg)
+
+
+async def _until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Poll *predicate* until true (bounded)."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+class _OverlapHarness:
+    """A ``FoxESSRealtimeWS`` wired to fake sockets, constants shrunk."""
+
+    def __init__(
+        self,
+        *,
+        proactive: float = 0.2,
+        handover_timeout: float = 1.0,
+        stale: float = 0.6,
+        backoff: float = 0.05,
+        sockets: list[Any] | None = None,
+    ) -> None:
+        self.loop = asyncio.get_event_loop()
+        self.delivered: list[dict[str, object]] = []
+        self.delivered_at: list[float] = []
+        self.connected_at_delivery: list[bool] = []
+        self.on_disconnect = MagicMock()
+        self.disconnects_before_stop = 0
+        self.deliveries_before_stop = 0
+        web_session = AsyncMock()
+        web_session.async_ensure_token = AsyncMock(return_value="tok")
+        self.ws = FoxESSRealtimeWS(
+            "plant1", web_session, self._on_data, self.on_disconnect
+        )
+        self.ws.PROACTIVE_RECONNECT_AFTER = proactive
+        self.ws.HANDOVER_TIMEOUT = handover_timeout
+        self.ws.STALE_TIMEOUT = stale
+        self.ws.HANDOVER_RETRY_BACKOFF = backoff
+        self.ws.RECONNECT_BASE_DELAY = 0.02
+        self.opened: list[Any] = list(sockets or [])
+        self.open_times: list[float] = []
+        self.ws._open_socket = self._open  # type: ignore[method-assign,assignment]
+
+    @property
+    def pending(self) -> object:
+        """The half-open second socket during a handover."""
+        return self.ws._pending_ws
+
+    @property
+    def live(self) -> object:
+        """The socket the listen loop currently reads."""
+        return self.ws._ws
+
+    async def _on_data(self, mapped: dict[str, object]) -> None:
+        self.delivered.append(mapped)
+        self.delivered_at.append(self.loop.time())
+        self.connected_at_delivery.append(self.ws.is_connected)
+
+    async def _open(self, token: str) -> _QueueSocket:
+        self.open_times.append(self.loop.time())
+        nxt = self.opened.pop(0) if self.opened else _QueueSocket("auto")
+        if isinstance(nxt, BaseException):
+            raise nxt
+        await nxt.send_str("getdata")  # as the real _open_socket does
+        return nxt
+
+    async def start(self, live: _QueueSocket) -> None:
+        """Connect with *live* as the first socket and start listening."""
+        self.opened.insert(0, live)
+        self.t_connect = self.loop.time()
+        await self.ws.async_connect()
+
+    async def stop(self) -> None:
+        # the listen loop reports a disconnect when it ends on teardown;
+        # what matters is whether one was reported before that
+        self.disconnects_before_stop = self.on_disconnect.call_count
+        self.deliveries_before_stop = len(self.delivered)
+        await self.ws.async_disconnect()
+
+    @property
+    def tasks_left(self) -> list[asyncio.Task[object]]:
+        me = asyncio.current_task()
+        return [
+            t
+            for t in asyncio.all_tasks()
+            if t is not me
+            and not t.done()
+            and any(
+                n in repr(t.get_coro())
+                for n in ("_handover_loop", "_listen_loop", "_first_accepted_frame")
+            )
+        ]
+
+
+@pytest.mark.asyncio
+class TestOverlapReconnect:
+    async def test_defaults(self) -> None:
+        assert FoxESSRealtimeWS.PROACTIVE_RECONNECT_AFTER == 270.0
+        assert FoxESSRealtimeWS.HANDOVER_TIMEOUT == 15.0
+
+    async def test_handover_fires_at_interval_and_not_before(self) -> None:
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.3, sockets=[new])
+        await h.start(old)
+        try:
+            for _ in range(5):  # keep the old socket healthy, ~0.1 s total
+                old.feed(_text_frame())
+                await asyncio.sleep(0.02)
+            # the only open so far is the initial connect
+            assert len(h.open_times) == 1
+            await _until(lambda: len(h.open_times) >= 2)
+            assert h.open_times[1] - h.t_connect >= 0.3 - 0.01
+            new.feed(_text_frame())
+            await _until(lambda: h.live is new)
+        finally:
+            await h.stop()
+
+    async def test_successful_swap_is_seamless(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("INFO", logger="custom_components.foxess_control.foxess")
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.2, sockets=[new])
+        await h.start(old)
+        connected_at_before = h.ws._connected_at
+        try:
+            await _until(lambda: len(h.open_times) >= 2)
+            # old keeps delivering while the second socket is connecting
+            old.feed(_text_frame(soc=61))
+            await _until(lambda: any(d.get("SoC") == 61.0 for d in h.delivered))
+            # first message on the new socket is the usual old snapshot
+            new.feed(_text_frame(time_diff=120, soc=1))
+            new.feed(_text_frame(soc=62))
+            await _until(lambda: h.live is new)
+            await _until(lambda: old.closed)
+        finally:
+            await h.stop()
+        assert h.disconnects_before_stop == 0
+        assert all(h.connected_at_delivery[: h.deliveries_before_stop])
+        socs = [d.get("SoC") for d in h.delivered]
+        assert 61.0 in socs and 62.0 in socs  # nothing dropped
+        assert 1.0 not in socs  # the stale snapshot was skipped
+        assert h.ws._connected_at > connected_at_before
+        assert new.sent == ["getdata"]
+        msgs = [(r.levelname, r.getMessage()) for r in caplog.records]
+        assert not [m for m in msgs if m[0] == "WARNING"]
+        assert any("handover started" in m[1] for m in msgs)
+        assert any("handover complete" in m[1] for m in msgs)
+
+    async def test_old_socket_going_quiet_does_not_trigger_reconnect(self) -> None:
+        """Newest client wins: the old socket may fall silent at once."""
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.2, stale=0.4, handover_timeout=2.0)
+        h.opened = [new]
+        reconnect = AsyncMock()
+        h.ws._try_reconnect = reconnect  # type: ignore[method-assign]
+        await h.start(old)
+        try:
+            old.feed(_text_frame())
+            await _until(lambda: len(h.open_times) >= 2)
+            # old stays silent past STALE_TIMEOUT; new answers late
+            await asyncio.sleep(0.6)
+            new.feed(_text_frame(soc=70))
+            await _until(lambda: h.live is new)
+        finally:
+            await h.stop()
+        reconnect.assert_not_called()
+        assert h.disconnects_before_stop == 0
+
+    async def test_old_socket_stale_frames_do_not_trigger_reconnect(self) -> None:
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.2, stale=0.4, handover_timeout=2.0)
+        h.opened = [new]
+        reconnect = AsyncMock()
+        h.ws._try_reconnect = reconnect  # type: ignore[method-assign]
+        await h.start(old)
+        try:
+            old.feed(_text_frame())
+            await _until(lambda: len(h.open_times) >= 2)
+            for _ in range(10):  # cloud keepalives for the superseded socket
+                old.feed(_text_frame(time_diff=999))
+                await asyncio.sleep(0.05)
+            new.feed(_text_frame(soc=71))
+            await _until(lambda: h.live is new)
+        finally:
+            await h.stop()
+        reconnect.assert_not_called()
+
+    async def test_new_socket_delivering_nothing_is_dropped_and_retried(self) -> None:
+        old = _QueueSocket("old")
+        dud, good = _QueueSocket("dud"), _QueueSocket("good")
+        h = _OverlapHarness(proactive=0.15, handover_timeout=0.2, sockets=[dud, good])
+        await h.start(old)
+        try:
+            await _until(lambda: dud.closed)
+            assert h.live is old and not old.closed
+            assert h.ws._pending_ws is None
+            old.feed(_text_frame())
+            await _until(lambda: len(h.open_times) >= 3)  # retried after backoff
+            good.feed(_text_frame(soc=72))
+            await _until(lambda: h.live is good)
+        finally:
+            await h.stop()
+        assert h.disconnects_before_stop == 0
+
+    async def test_new_socket_connect_failure_keeps_old(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("INFO", logger="custom_components.foxess_control.foxess")
+        old = _QueueSocket("old")
+        h = _OverlapHarness(proactive=0.15, sockets=[ConnectionRefusedError("no")])
+        await h.start(old)
+        try:
+            await _until(lambda: len(h.open_times) >= 3)  # failed once, retried
+            assert h.live is old and not old.closed
+            assert h.ws.is_connected
+        finally:
+            await h.stop()
+        assert h.disconnects_before_stop == 0
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    async def test_old_socket_dying_during_handover_uses_normal_reconnect(
+        self,
+    ) -> None:
+        old = _QueueSocket("old")
+        dud = _QueueSocket("dud")
+        h = _OverlapHarness(proactive=0.15, handover_timeout=0.3, sockets=[dud])
+        reconnect = AsyncMock()
+
+        async def _fake_reconnect() -> None:
+            h.ws._connected = False
+
+        reconnect.side_effect = _fake_reconnect
+        h.ws._try_reconnect = reconnect  # type: ignore[method-assign]
+        await h.start(old)
+        try:
+            await _until(lambda: len(h.open_times) >= 2)
+            await old.close()  # server closes the old socket; new gives nothing
+            await _until(lambda: reconnect.await_count == 1)
+        finally:
+            await h.stop()
+        assert dud.closed
+
+    async def test_old_socket_closing_during_handover_swaps_instead(self) -> None:
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.15, handover_timeout=2.0, sockets=[new])
+        reconnect = AsyncMock()
+        h.ws._try_reconnect = reconnect  # type: ignore[method-assign]
+        await h.start(old)
+        try:
+            await _until(lambda: len(h.open_times) >= 2)
+            await old.close()
+            new.feed(_text_frame(soc=73))
+            await _until(lambda: h.live is new)
+        finally:
+            await h.stop()
+        reconnect.assert_not_called()
+        assert h.disconnects_before_stop == 0
+
+    async def test_async_disconnect_during_handover_leaves_nothing(self) -> None:
+        old, half_open = _QueueSocket("old"), _QueueSocket("half")
+        h = _OverlapHarness(proactive=0.1, handover_timeout=5.0, sockets=[half_open])
+        await h.start(old)
+        await _until(lambda: h.pending is half_open)
+        await h.ws.async_disconnect()
+        assert half_open.closed and old.closed
+        assert h.ws._pending_ws is None
+        assert h.ws._handover_task is None
+        assert h.ws._handover_active is False
+        await asyncio.sleep(0.05)
+        assert h.tasks_left == []
+        assert len(h.open_times) == 2  # no further attempts
+
+    async def test_request_stop_during_handover_aborts_without_swap(self) -> None:
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.1, handover_timeout=5.0, sockets=[new])
+        await h.start(old)
+        try:
+            await _until(lambda: h.pending is new)
+            h.ws.request_stop()  # linger phase: no revival, no handover
+            new.feed(_text_frame(soc=74))
+            await _until(lambda: new.closed)
+            assert h.live is old
+            assert 74.0 not in [d.get("SoC") for d in h.delivered]
+            await _until(
+                lambda: h.ws._handover_task is not None and h.ws._handover_task.done()
+            )
+        finally:
+            await h.stop()
+        assert len(h.open_times) == 2
+
+    async def test_stop_event_prevents_handover(self) -> None:
+        old = _QueueSocket("old")
+        h = _OverlapHarness(proactive=0.1)
+        await h.start(old)
+        h.ws._stop_event.set()
+        await asyncio.sleep(0.25)
+        await h.stop()
+        assert len(h.open_times) == 1
+
+    async def test_disabled_when_interval_is_zero(self) -> None:
+        h = _OverlapHarness(proactive=0)
+        await h.start(_QueueSocket("old"))
+        try:
+            assert h.ws._handover_task is None
+        finally:
+            await h.stop()
+
+    async def test_tracker_and_reference_survive_the_swap(self) -> None:
+        old, new = _QueueSocket("old"), _QueueSocket("new")
+        h = _OverlapHarness(proactive=0.15, sockets=[new])
+        tracker = h.ws._grid_direction
+
+        def frame(
+            *, solar: float = 2.0, grid: float = 5.0, grid_flag: int | None = 1
+        ) -> aiohttp.WSMessage:
+            msg = _ev_msg(
+                solar=solar,
+                load=0.5,
+                bat_charge=0.0,
+                grid=grid,
+                charger=0.0,
+                grid_status=2,
+                grid_flag=grid_flag,
+            )
+            return aiohttp.WSMessage(
+                type=aiohttp.WSMsgType.TEXT, data=json.dumps(msg), extra=None
+            )
+
+        await h.start(old)
+        old.feed(frame())
+        await _until(lambda: len(h.delivered) == 1)
+        assert tracker.importing is True
+        learned = dict(tracker._status_meaning)
+        assert learned  # gridStatus 2 learned as import from the signed flag
+        last_useful = h.ws._last_useful_data
+        try:
+            await _until(lambda: len(h.open_times) >= 2)
+            # no signed flag and an unusable balance (0.0 kW predicted): only
+            # the learned gridStatus=2 -> import meaning can decide.  A fresh
+            # tracker would fall back to the legacy rule and say export.
+            new.feed(frame(grid_flag=None, solar=0.5, grid=0.6))
+            await _until(lambda: h.live is new)
+        finally:
+            await h.stop()
+        assert h.ws._grid_direction is tracker
+        assert tracker._status_meaning == learned
+        assert h.ws._last_useful_data >= last_useful
+        assert h.delivered[-1]["gridConsumptionPower"] == pytest.approx(0.6)
+
+
+class _CutoffCloud:
+    """Fake cloud: each socket delivers until ``cut_after`` s, then goes silent.
+
+    Newest socket gets real frames; older ones get ``timeDiff: 999`` keepalives
+    (the simulator's newest-wins rule).
+    """
+
+    def __init__(self, cut_after: float, interval: float = 0.02) -> None:
+        self.cut_after = cut_after
+        self.interval = interval
+        self.sockets: list[_QueueSocket] = []
+        self._tasks: list[asyncio.Task[None]] = []
+
+    async def open(self, token: str) -> _QueueSocket:
+        sock = _QueueSocket(f"cloud{len(self.sockets)}")
+        self.sockets.append(sock)
+        self._tasks.append(asyncio.ensure_future(self._feed(sock)))
+        return sock
+
+    async def _feed(self, sock: _QueueSocket) -> None:
+        loop = asyncio.get_event_loop()
+        born = loop.time()
+        # first frame after connect is an old snapshot, as on the real cloud
+        sock.feed(_text_frame(time_diff=61, soc=1))
+        while not sock.closed and loop.time() - born < self.cut_after:
+            await asyncio.sleep(self.interval)
+            newest = sock is self.sockets[-1]
+            sock.feed(_text_frame(soc=65) if newest else _text_frame(time_diff=999))
+
+    async def aclose(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+def _max_gap(times: list[float], start: float, end: float) -> float:
+    pts = [start, *[t for t in times if start <= t <= end], end]
+    return max(b - a for a, b in itertools.pairwise(pts))
+
+
+@pytest.mark.asyncio
+class TestStreamCutAtFixedAge:
+    """The cloud cuts every connection at a fixed age; the gap must vanish."""
+
+    RUN_FOR = 2.0
+    CUT = 0.6
+
+    async def _run(self, proactive: float) -> tuple[_OverlapHarness, float, float]:
+        cloud = _CutoffCloud(cut_after=self.CUT)
+        h = _OverlapHarness(proactive=proactive, stale=0.5, handover_timeout=1.0)
+        h.ws._open_socket = cloud.open  # type: ignore[method-assign,assignment]
+        t0 = h.loop.time()
+        try:
+            await h.ws.async_connect()
+            # first frame is a stale snapshot; wait for real data, then run
+            await _until(lambda: len(h.delivered) >= 1)
+            start = h.loop.time()
+            await asyncio.sleep(self.RUN_FOR)
+            end = h.loop.time()
+        finally:
+            await h.stop()
+            await cloud.aclose()
+        assert t0 < start
+        return h, start, end
+
+    async def test_no_gap_with_overlap_reconnect(self) -> None:
+        h, start, end = await self._run(proactive=0.35)
+        assert h.disconnects_before_stop == 0
+        assert all(h.connected_at_delivery[: h.deliveries_before_stop])
+        assert _max_gap(h.delivered_at, start, end) < 0.25
+
+    async def test_baseline_without_overlap_has_the_old_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "custom_components.foxess_control.foxess.realtime_ws.random.uniform",
+            lambda a, b: 0.0,
+        )
+        h, start, end = await self._run(proactive=0)
+        assert h.disconnects_before_stop >= 1  # badge flipped to api
+        assert _max_gap(h.delivered_at, start, end) >= 0.5  # >= STALE_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_overlap_reconnect_against_the_simulator(
+    foxess_sim: SimulatorHandle,
+) -> None:
+    """Real sockets, real aiohttp close semantics, newest-wins + stream cutoff."""
+    foxess_sim.set(
+        fuzzing=False, ws_push_interval_s=0.05, ws_stream_cutoff_s=1.5, soc=65
+    )
+    loop = asyncio.get_event_loop()
+    times: list[float] = []
+
+    async def on_data(mapped: dict[str, object]) -> None:
+        times.append(loop.time())
+
+    on_disconnect = MagicMock()
+    web_session = AsyncMock()
+    web_session.async_ensure_token = AsyncMock(return_value="tok")
+    ws = FoxESSRealtimeWS(
+        "plant1",
+        web_session,
+        on_data,
+        on_disconnect,
+        ws_url=foxess_sim.url.replace("http://", "ws://") + "/dew/v0/wsmaitian",
+    )
+    ws.PROACTIVE_RECONNECT_AFTER = 0.6
+    ws.HANDOVER_TIMEOUT = 3.0
+    ws.STALE_TIMEOUT = 1.0
+    swaps = 0
+    original = ws._handover_once
+
+    async def counting() -> bool:
+        nonlocal swaps
+        ok = await original()
+        swaps += ok
+        return ok
+
+    ws._handover_once = counting  # type: ignore[method-assign]
+    try:
+        await ws.async_connect()
+        await _until(lambda: len(times) >= 1)
+        start = loop.time()
+        await _until(lambda: swaps >= 3, timeout=30.0)
+        end = loop.time()
+    finally:
+        disconnects_before_stop = on_disconnect.call_count
+        await ws.async_disconnect()
+    assert disconnects_before_stop == 0
+    assert _max_gap(times, start, end) < 0.9
