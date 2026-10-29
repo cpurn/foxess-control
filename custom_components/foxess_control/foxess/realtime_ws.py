@@ -285,6 +285,10 @@ class FoxESSRealtimeWS:
     RECONNECT_MAX_DELAY = 60.0
     STALE_TIMEOUT = 30.0  # no message in this many seconds = dead
     MAX_TIME_DIFF = 30  # skip messages older than this (seconds)
+    # Re-send "getdata" on the open connection this often.  Experiment: the
+    # cloud stream goes silent ~298 s after connect; this tests whether it is
+    # a bounded subscription that has to be renewed.
+    GETDATA_RESEND_INTERVAL = 60.0
 
     def __init__(
         self,
@@ -317,6 +321,7 @@ class FoxESSRealtimeWS:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._http_session: aiohttp.ClientSession | None = None
         self._listen_task: asyncio.Task[None] | None = None
+        self._resend_task: asyncio.Task[None] | None = None
         self._connected = False
         self._stop_event = asyncio.Event()
         # Set by ``request_stop`` to prevent ``_try_reconnect`` from
@@ -385,10 +390,37 @@ class FoxESSRealtimeWS:
             timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
         )
         await self._ws.send_str("getdata")
+        self._cancel_resend_task()
+        self._resend_task = asyncio.ensure_future(self._resend_getdata_loop(self._ws))
         self._last_accepted = None
         self._connected = True
         self._last_useful_data = asyncio.get_event_loop().time()
         _LOGGER.info("FoxESS WebSocket connected (plant=%s)", self._plant_id)
+
+    def _cancel_resend_task(self) -> None:
+        """Stop the periodic "getdata" re-send task, if running."""
+        task = self._resend_task
+        self._resend_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _resend_getdata_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Re-send "getdata" on *ws* every ``GETDATA_RESEND_INTERVAL`` seconds.
+
+        Bound to one connection: ends when that socket closes, on shutdown
+        (``_stop_event``/``_no_reconnect``) or on a send error (the listen
+        loop owns recovery).
+        """
+        while True:
+            await asyncio.sleep(self.GETDATA_RESEND_INTERVAL)
+            if self._stop_event.is_set() or self._no_reconnect or ws.closed:
+                return
+            try:
+                await ws.send_str("getdata")
+            except Exception:
+                _LOGGER.debug("FoxESS WebSocket getdata re-send failed", exc_info=True)
+                return
+            _LOGGER.debug("FoxESS WebSocket: re-sent getdata")
 
     async def _listen_loop(self) -> None:
         """Receive messages, reconnect on failure."""
@@ -569,6 +601,7 @@ class FoxESSRealtimeWS:
 
     async def _close_ws(self) -> None:
         """Close the WebSocket connection if open."""
+        self._cancel_resend_task()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None

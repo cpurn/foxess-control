@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1165,3 +1166,161 @@ class TestReconnectRespectsGate:
             await ws._try_reconnect()
 
         assert connect_attempts["n"] == 1
+
+
+class _FakeSocket:
+    """Minimal stand-in for ``aiohttp.ClientWebSocketResponse``."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.sent: list[str] = []
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestGetdataResend:
+    """The open connection is re-subscribed with "getdata" on a timer."""
+
+    @staticmethod
+    def _make_ws(interval: float = 0.01) -> FoxESSRealtimeWS:
+        web_session = AsyncMock()
+        web_session.async_ensure_token = AsyncMock(return_value="tok")
+        ws = FoxESSRealtimeWS("plant1", web_session, AsyncMock(), MagicMock())
+        ws.GETDATA_RESEND_INTERVAL = interval
+        return ws
+
+    def test_default_interval_is_60_seconds(self) -> None:
+        assert FoxESSRealtimeWS.GETDATA_RESEND_INTERVAL == 60.0
+
+    @pytest.mark.asyncio
+    async def test_resends_getdata_on_schedule(self) -> None:
+        ws = self._make_ws()
+        sock = _FakeSocket()
+        task = asyncio.ensure_future(
+            ws._resend_getdata_loop(sock)  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.1)
+        task.cancel()
+        assert len(sock.sent) >= 3
+        assert set(sock.sent) == {"getdata"}
+
+    @pytest.mark.asyncio
+    async def test_no_send_before_first_interval(self) -> None:
+        ws = self._make_ws(interval=10.0)
+        sock = _FakeSocket()
+        task = asyncio.ensure_future(
+            ws._resend_getdata_loop(sock)  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        assert sock.sent == []
+
+    @pytest.mark.asyncio
+    async def test_stops_when_socket_closes(self) -> None:
+        ws = self._make_ws()
+        sock = _FakeSocket()
+        task = asyncio.ensure_future(
+            ws._resend_getdata_loop(sock)  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.05)
+        sock.closed = True
+        await asyncio.wait_for(task, timeout=1.0)
+        sent = len(sock.sent)
+        await asyncio.sleep(0.05)
+        assert len(sock.sent) == sent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", ["_stop_event", "_no_reconnect"])
+    async def test_no_send_after_stop(self, flag: str) -> None:
+        ws = self._make_ws()
+        sock = _FakeSocket()
+        if flag == "_stop_event":
+            ws._stop_event.set()
+        else:
+            ws._no_reconnect = True
+        await asyncio.wait_for(
+            ws._resend_getdata_loop(sock),  # type: ignore[arg-type]
+            timeout=1.0,
+        )
+        assert sock.sent == []
+
+    @pytest.mark.asyncio
+    async def test_send_error_ends_task_without_raising(self) -> None:
+        ws = self._make_ws()
+        sock = _FakeSocket()
+        sock.send_str = AsyncMock(side_effect=ConnectionResetError)  # type: ignore[method-assign]
+        await asyncio.wait_for(
+            ws._resend_getdata_loop(sock),  # type: ignore[arg-type]
+            timeout=1.0,
+        )
+        assert sock.send_str.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_connect_starts_task_and_close_cancels_it(self) -> None:
+        ws = self._make_ws(interval=0.02)
+        sock = _FakeSocket()
+        session = MagicMock()
+        session.closed = False
+        session.ws_connect = AsyncMock(return_value=sock)
+        ws._http_session = session
+
+        await ws._do_connect("tok")
+        task = ws._resend_task
+        assert task is not None
+        assert sock.sent == ["getdata"]  # initial subscribe
+
+        await asyncio.sleep(0.1)
+        assert len(sock.sent) >= 3
+
+        await ws._close_ws()
+        await asyncio.sleep(0)
+        assert task.cancelled() or task.done()
+        assert ws._resend_task is None
+        sent = len(sock.sent)
+        await asyncio.sleep(0.06)
+        assert len(sock.sent) == sent
+
+    @pytest.mark.asyncio
+    async def test_reconnect_replaces_previous_task(self) -> None:
+        ws = self._make_ws(interval=0.02)
+        first, second = _FakeSocket(), _FakeSocket()
+        session = MagicMock()
+        session.closed = False
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        ws._http_session = session
+
+        await ws._do_connect("tok")
+        old_task = ws._resend_task
+        await ws._do_connect("tok")
+        await asyncio.sleep(0.1)
+
+        assert old_task is not ws._resend_task
+        assert old_task is not None
+        assert old_task.cancelled() or old_task.done()
+        first_sent = len(first.sent)
+        await asyncio.sleep(0.06)
+        assert len(first.sent) == first_sent  # old socket no longer re-sent to
+        assert len(second.sent) >= 3
+
+    @pytest.mark.asyncio
+    async def test_async_disconnect_stops_resending(self) -> None:
+        ws = self._make_ws(interval=0.02)
+        sock = _FakeSocket()
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        session.ws_connect = AsyncMock(return_value=sock)
+        ws._http_session = session
+        await ws._do_connect("tok")
+        ws._ws = sock  # type: ignore[assignment]
+
+        await ws.async_disconnect()
+
+        assert ws._resend_task is None
+        sent = len(sock.sent)
+        await asyncio.sleep(0.06)
+        assert len(sock.sent) == sent
