@@ -1304,9 +1304,10 @@ class TestPlausibilityLockup:
     @pytest.mark.asyncio
     async def test_lone_glitch_is_still_dropped(self) -> None:
         """The anti-glitch purpose stays: one odd frame never reaches on_data."""
-        delivered, _ = await self._run([500, 500, 40, 500, 500, 500])
+        delivered, reconnects = await self._run([500, 500, 40, 500, 500, 500])
         assert 0.04 not in delivered
         assert delivered == [0.5] * 5
+        assert reconnects == []
 
     @pytest.mark.asyncio
     async def test_two_different_glitches_are_not_a_level(self) -> None:
@@ -1334,3 +1335,37 @@ class TestPlausibilityLockup:
         assert delivered == [3.0]
         assert reconnects, "no reconnect after 10 minutes of only dropped frames"
         assert reconnects[0] <= 3
+
+    @pytest.mark.asyncio
+    async def test_dropped_frames_below_the_limit_do_not_reconnect(self) -> None:
+        """A short run of dropped frames is the filter doing its job."""
+        frames = [3000] + [200, 40000] * 20
+
+        def age_just_under_the_limit(ws: FoxESSRealtimeWS, n: int) -> None:
+            if n == 1:
+                ws._last_useful_data -= ws.DROPPED_FRAMES_RECONNECT_AFTER - 30.0
+
+        delivered, reconnects = await self._run(frames, age_just_under_the_limit)
+        assert delivered == [3.0]
+        assert reconnects == []
+
+    def test_dropped_frames_limit_default(self) -> None:
+        """Class constant, well above the 30 s silence timeout."""
+        assert FoxESSRealtimeWS.DROPPED_FRAMES_RECONNECT_AFTER == 120.0
+
+    @pytest.mark.asyncio
+    async def test_reconnect_clears_the_stuck_reference(self) -> None:
+        """The reconnect path (``_do_connect``) resets anchor and pending."""
+        web_session = AsyncMock()
+        web_session.async_ensure_token = AsyncMock(return_value="tok")
+        ws = FoxESSRealtimeWS("plant1", web_session, AsyncMock(), MagicMock())
+        ws._last_accepted = {"loadsPower": 6.88}
+        ws._pending = {"loadsPower": 0.5}
+        session = MagicMock()
+        session.closed = False
+        sock = AsyncMock()
+        session.ws_connect = AsyncMock(return_value=sock)
+        ws._http_session = session
+        await ws._do_connect("tok")
+        assert ws._last_accepted is None
+        assert ws._pending is None
