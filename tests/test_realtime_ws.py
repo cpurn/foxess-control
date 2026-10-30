@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -1165,3 +1166,171 @@ class TestReconnectRespectsGate:
             await ws._try_reconnect()
 
         assert connect_attempts["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Plausibility filter must not lock up on a level change that sticks
+# ---------------------------------------------------------------------------
+
+
+def _load_frame(load_w: float, time_diff: int = 5) -> aiohttp.WSMessage:
+    """A fresh frame whose only moving part is the household load (W).
+
+    PV and battery are idle and the grid carries the load, so
+    ``loadsPower`` and ``gridConsumptionPower`` both follow *load_w*.
+    """
+    return aiohttp.WSMessage(
+        type=aiohttp.WSMsgType.TEXT,
+        data=json.dumps(
+            {
+                "errno": 0,
+                "result": {
+                    "node": {
+                        "solar": {"power": {"value": "0"}},
+                        "grid": {"power": {"value": str(load_w)}, "gridStatus": 2},
+                        "bat": {"power": {"value": "0"}, "soc": 60, "charge": 0},
+                        "load": {"power": {"value": str(load_w)}},
+                    },
+                    "timeDiff": time_diff,
+                },
+            }
+        ),
+        extra=None,
+    )
+
+
+class TestPlausibilityLockup:
+    """Live fault: ``loadsPower`` jumped to 6.88 kW (EV counted in the load
+    for a moment) and was accepted; the settled ~0.5 kW frames that followed
+    are 13.8x lower, so every one was dropped as "anomalous" for 15+ minutes.
+    Dropped frames neither refresh ``_last_useful_data`` nor time out the
+    socket (fresh frames keep arriving), so no stale warning and no
+    reconnect: ``data_source`` stayed ``api`` while ``ws_connected`` was True.
+
+    A level that persists is a real change; a lone frame is a glitch.  After
+    a short run of consistent frames the new level must reach ``on_data``,
+    and if nothing is accepted for a long time while frames keep arriving
+    the socket must be re-established.
+    """
+
+    SETTLED = 3  # consecutive consistent frames after which a level is real
+
+    @staticmethod
+    async def _run(
+        frames_w: list[float],
+        before_frame: Callable[[FoxESSRealtimeWS, int], None] | None = None,
+    ) -> tuple[list[float], list[int]]:
+        """Feed *frames_w* through the listen loop.
+
+        Returns ``(loadsPower values handed to on_data, indices of the frames
+        that were being awaited when a reconnect was requested)``.  The
+        trailing CLOSED message is not counted as a reconnect request.
+        """
+        delivered: list[float] = []
+
+        async def on_data(data: dict[str, Any]) -> None:
+            delivered.append(data["loadsPower"])
+
+        web_session = AsyncMock()
+        web_session.async_ensure_token = AsyncMock(return_value="tok")
+        ws = FoxESSRealtimeWS("plant1", web_session, on_data, MagicMock())
+
+        position = {"n": 0}
+        reconnects: list[int] = []
+        closed = aiohttp.WSMessage(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None)
+
+        async def receive() -> aiohttp.WSMessage:
+            n = position["n"]
+            position["n"] += 1
+            if n >= len(frames_w):
+                return closed
+            if before_frame is not None:
+                before_frame(ws, n)
+            return _load_frame(frames_w[n])
+
+        mock_ws = AsyncMock()
+        mock_ws.receive = receive
+        mock_ws.closed = True
+        ws._ws = mock_ws
+        ws._connected = True
+        ws._stop_event.clear()
+
+        async def fake_reconnect() -> None:
+            reconnects.append(position["n"] - 1)
+            ws._connected = False  # ends the loop
+
+        with patch.object(ws, "_try_reconnect", side_effect=fake_reconnect):
+            await ws._listen_loop()
+        return delivered, [i for i in reconnects if i < len(frames_w)]
+
+    @pytest.mark.asyncio
+    async def test_settled_level_after_spike_is_accepted(self) -> None:
+        """The reported fault: 6.88 kW accepted, then settled 0.5 kW frames."""
+        delivered, reconnects = await self._run([700, 6880] + [500] * 12)
+        assert delivered[:2] == [0.7, 6.88]
+        assert delivered[-1] == 0.5, (
+            f"settled 0.5 kW never accepted after the 6.88 kW spike: {delivered}"
+        )
+        first = delivered.index(0.5)
+        assert first <= 1 + self.SETTLED, f"took {first - 1} frames: {delivered}"
+        assert reconnects == []
+
+    @pytest.mark.asyncio
+    async def test_ev_start_is_accepted(self) -> None:
+        """Idle ~0.5 kW to a sustained 6.88 kW (charger starts)."""
+        delivered, _ = await self._run([500] * 3 + [6880] * 10)
+        assert delivered[-1] == 6.88, f"sustained EV load never accepted: {delivered}"
+        assert delivered.index(6.88) <= 2 + self.SETTLED
+
+    @pytest.mark.asyncio
+    async def test_ev_stop_is_accepted(self) -> None:
+        """Sustained 6.88 kW back to ~0.5 kW (charger stops)."""
+        delivered, _ = await self._run([6880] * 3 + [500] * 10)
+        assert delivered[-1] == 0.5, (
+            f"load after the EV stopped never accepted: {delivered}"
+        )
+        assert delivered.index(0.5) <= 2 + self.SETTLED
+
+    @pytest.mark.asyncio
+    async def test_ev_start_stop_cycle_follows_the_load(self) -> None:
+        """Start, stop, start again: each sustained level is followed."""
+        frames = [500] * 3 + [6880] * 6 + [500] * 6 + [6880] * 6
+        delivered, _ = await self._run(frames)
+        assert delivered[-1] == 6.88
+        # Every sustained plateau reached on_data at least once.
+        assert delivered.count(0.5) >= 3 + 1
+        assert 6.88 in delivered[: 3 + 6 + 1]
+
+    @pytest.mark.asyncio
+    async def test_lone_glitch_is_still_dropped(self) -> None:
+        """The anti-glitch purpose stays: one odd frame never reaches on_data."""
+        delivered, _ = await self._run([500, 500, 40, 500, 500, 500])
+        assert 0.04 not in delivered
+        assert delivered == [0.5] * 5
+
+    @pytest.mark.asyncio
+    async def test_two_different_glitches_are_not_a_level(self) -> None:
+        """Divergent frames that disagree with each other never become one."""
+        delivered, _ = await self._run([3000, 3000, 200, 40000, 200, 3000, 3000])
+        assert 0.2 not in delivered
+        assert 40.0 not in delivered
+
+    @pytest.mark.asyncio
+    async def test_only_dropped_frames_for_long_forces_reconnect(self) -> None:
+        """Safety net: frames keep arriving but none is accepted for minutes.
+
+        The frames alternate between two levels that each diverge from the
+        reference and from each other, so no level ever becomes consistent.
+        After a long enough run of that the socket is considered broken and
+        re-established, like a silent one would be.
+        """
+        frames = [3000] + [200, 40000] * 20
+
+        def age_the_last_accepted(ws: FoxESSRealtimeWS, n: int) -> None:
+            if n == 1:  # pretend the accepted frame was 10 minutes ago
+                ws._last_useful_data -= 600.0
+
+        delivered, reconnects = await self._run(frames, age_the_last_accepted)
+        assert delivered == [3.0]
+        assert reconnects, "no reconnect after 10 minutes of only dropped frames"
+        assert reconnects[0] <= 3
