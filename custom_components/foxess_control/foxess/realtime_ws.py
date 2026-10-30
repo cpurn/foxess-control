@@ -348,6 +348,10 @@ class FoxESSRealtimeWS:
     RECONNECT_MAX_DELAY = 60.0
     STALE_TIMEOUT = 30.0  # no message in this many seconds = dead
     MAX_TIME_DIFF = 30  # skip messages older than this (seconds)
+    # Fresh frames keep arriving but none has passed the plausibility
+    # filter for this long: the reference is stuck, treat it as a dead
+    # stream and reconnect (which resets ``_last_accepted``/``_pending``).
+    DROPPED_FRAMES_RECONNECT_AFTER = 120.0
 
     def __init__(
         self,
@@ -646,6 +650,22 @@ class FoxESSRealtimeWS:
             if mapped:
                 accepted = self._process_mapped_frame(mapped)
                 if accepted is None:
+                    # Dropped frames refresh neither ``_last_useful_data``
+                    # nor the receive() timeout, so a reference stuck on
+                    # a stale level would otherwise drop every frame
+                    # forever with no stale warning and no reconnect.
+                    now = asyncio.get_event_loop().time()
+                    if now - self._last_useful_data > (
+                        self.DROPPED_FRAMES_RECONNECT_AFTER
+                    ):
+                        _LOGGER.warning(
+                            "FoxESS WebSocket: no frame accepted in %.0fs "
+                            "(only dropped frames), reconnecting",
+                            now - self._last_useful_data,
+                        )
+                        await self._try_reconnect()
+                        if not self._connected:
+                            break
                     continue
                 self._last_useful_data = asyncio.get_event_loop().time()
                 try:
