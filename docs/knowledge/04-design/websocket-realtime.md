@@ -267,6 +267,18 @@ physically impossible values. Filtering at the WS layer (in
 `realtime_ws.py`) rather than the coordinator keeps the coordinator
 agnostic to data source quirks. The filter maintains its own
 `_last_accepted` state that resets on reconnection.
+A divergent frame is held as `_pending` and dropped; if the next
+frame agrees with it (within 10x) the new level is sustained and is
+accepted, so a charger start/stop or a spike that settles at a
+different level costs one frame, while a lone glitch stays dropped.
+Dropped frames refreshed neither the silence timer nor the receive()
+timeout (fresh frames kept arriving), so a reference stuck on a stale
+level dropped every frame with no stale warning and no reconnect,
+`data_source` stayed `api` while `ws_connected` was True.
+`FoxESSRealtimeWS.DROPPED_FRAMES_RECONNECT_AFTER` (120 s): if no frame
+has been accepted for that long while frames keep arriving, the listen
+loop logs a WARNING and reconnects, which resets
+`_last_accepted`/`_pending`.
 **Priority served**: P-005 (Operational transparency)
 **Trades against**: none
 **Classification**: safety
@@ -278,7 +290,8 @@ agnostic to data source quirks. The filter maintains its own
   by installation and is not always known
 **Traces**: C-004, C-005;
 `tests/test_realtime_ws.py::TestIsPlausible` (11 tests),
-`tests/test_realtime_ws.py::TestWsPlausibilityFilter` (3 tests)
+`tests/test_realtime_ws.py::TestWsPlausibilityFilter` (3 tests),
+`tests/test_realtime_ws.py::TestPlausibilityLockup` (10 tests)
 
 ### D-030: Data staleness indicator on Lovelace cards
 **Decision**: Both Lovelace cards (overview and control) compute data
