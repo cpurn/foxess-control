@@ -11,7 +11,7 @@ import aiohttp
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 from custom_components.foxess_control.foxess.realtime_ws import (
     FoxESSRealtimeWS,
@@ -1217,7 +1217,7 @@ class TestPlausibilityLockup:
 
     @staticmethod
     async def _run(
-        frames_w: list[float],
+        frames_w: Sequence[float],
         before_frame: Callable[[FoxESSRealtimeWS, int], None] | None = None,
     ) -> tuple[list[float], list[int]]:
         """Feed *frames_w* through the listen loop.
