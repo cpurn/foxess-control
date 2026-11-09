@@ -452,6 +452,71 @@ never learns that `pvPower` may include an external term.
 **Traces**: C-035, C-021, C-039, C-020, C-026; D-010 (grid-direction
 balance the external term improves).
 
+### D-064: Proactive socket handover before the cloud stops the push
+**Decision**: ~270 s (`PROACTIVE_RECONNECT_AFTER`) after the current socket
+connected, `FoxESSRealtimeWS` opens a **second** socket with the same token
+and plant, sends its own `getdata`, keeps the live socket delivering, and
+swaps to the new socket on its **first accepted frame**: `timeDiff <= 30`
+(C-005) and it passes the plausibility filter (D-041). A cached/stale frame
+or a dropped one does not trigger the swap. The old socket is then closed.
+A successful handover never calls `on_disconnect`, never changes
+`_connected`, drops no frame and logs at INFO (`proactive handover started
+(connection age N s)`, `handover complete (new socket accepted frame after N
+s)`). Only one handover runs at a time. If the new socket gets no accepted
+frame within `HANDOVER_TIMEOUT` (15 s), or fails to connect, it is closed,
+the old socket is kept (`handover failed: no accepted frame in 15 s, keeping
+old socket`) and the attempt is retried after `HANDOVER_RETRY_BACKOFF`
+(10 s) while the live socket is still healthy. While a handover is in
+flight a timeout, close, error or stale-only stream on the *old* socket is
+not treated as a dead connection (newest client wins: the old socket goes
+quiet at once); if the handover itself fails the existing 30 s stale ->
+`_try_reconnect` path runs unchanged. `request_stop`, `_stop_event` and
+`async_disconnect` cancel the timer and close a half-open second socket. The
+`GridDirectionTracker`, `_last_accepted`, `_pending` (D-041 corroboration)
+and `_last_useful_data` belong to the `FoxESSRealtimeWS`, not to a socket, so
+they carry across the swap; the 120 s `DROPPED_FRAMES_RECONNECT_AFTER` rule
+is untouched.
+**Context**: Measured live 2026-10-29 and 2026-11-09: the cloud stops pushing
+live frames ~298-300 s after every connect while the socket stays open and
+keeps answering heartbeats. The 30 s silence check (C-005) then fires, the
+badge flips to `api`, and the reconnect 5-8 s later restores `ws` - one
+`ws -> api -> ws` cycle every 5 min 36 s, ~40 s of frozen or REST-only data
+each. After the stop, a `getdata` (ours or the web portal's) returns only
+one **cached** frame per request with `timeDiff` well over 30 (61, 61, 88
+seen), which C-005 discards; live frames came back on their own only ~100 s
+after the last live one in the portal capture. Re-sending `getdata` every
+60 s while frames flow did not extend the stream, and a same-socket nudge
+after 10 s of silence (repeated every 10 s up to 50 s) did not restore live
+data within 70 s. A reconnect gets live frames within ~10 s, and HA plus a
+browser connection coexist, so a parallel second socket is allowed.
+**Rationale**: The cut is on the push, tied to the connection's age, and
+cannot be undone from the same socket. Opening the replacement *before* the
+cut makes the stream continuous: the new socket's first accepted frame
+arrives while the old one still delivers. Swapping on the first accepted
+frame (not on connect) guarantees the replacement actually carries fresh,
+plausible data. Reusing the cached web token avoids a second login that might
+invalidate the first session.
+**Priority served**: P-005 (Operational transparency)
+**Trades against**: none
+**Classification**: other
+**Alternatives considered**:
+- Re-send `getdata` periodically while frames flow: tried live, did not
+  extend the stream.
+- Nudge the same socket with `getdata` after silence (single, then every 10
+  s up to 5x with a 70 s stale timeout): tried live, only cached stale frames
+  come back; no live data within 70 s.
+- Shorten the 30 s silence check: only shrinks the gap, and ~5 s frame
+  jitter leaves little margin; C-005 documents 30 s.
+- Hold the `ws` badge for a grace period: hides the flip but not the
+  frozen data (against C-020).
+- Close the old socket first and reconnect: the original behaviour, ~40 s
+  gap every cycle.
+**Traces**: C-005, C-020;
+`tests/test_realtime_ws.py::TestOverlapReconnect`,
+`tests/test_realtime_ws.py::TestStreamCutAtFixedAge`,
+`tests/test_realtime_ws.py::test_overlap_reconnect_against_the_simulator`,
+`tests/test_realtime_ws.py::test_getdata_after_the_cut_only_returns_a_cached_frame`
+
 ## Key Behaviours
 
 - WebSocket requires web portal credentials (username + MD5(password)),
