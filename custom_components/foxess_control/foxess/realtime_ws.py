@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -98,6 +99,15 @@ def _is_plausible(candidate: dict[str, Any], reference: dict[str, Any] | None) -
         ):
             return False
     return True
+
+
+_SECRETISH = re.compile(r"[A-Za-z0-9_.%\-]{24,}")
+
+
+def _mask(text: str) -> str:
+    """Hide plant ids, tokens and anything token-like in logged text."""
+    text = re.sub(r"(plantId|token)=[^&\s]*", r"\1=XXX", text)
+    return _SECRETISH.sub("XXX", text)
 
 
 class GridDirectionTracker:
@@ -284,7 +294,9 @@ class FoxESSRealtimeWS:
     RECONNECT_MAX_ATTEMPTS = 5
     RECONNECT_BASE_DELAY = 5.0
     RECONNECT_MAX_DELAY = 60.0
-    STALE_TIMEOUT = 30.0  # no message in this many seconds = dead
+    # EXPERIMENT build: 70 s (was 30 s) so the later nudges get a chance
+    # before the stale reconnect.
+    STALE_TIMEOUT = 70.0  # no message in this many seconds = dead
     MAX_TIME_DIFF = 30  # skip messages older than this (seconds)
     # Fresh frames keep arriving but none has passed the plausibility
     # filter for this long: the reference is stuck, treat it as a dead
@@ -297,6 +309,13 @@ class FoxESSRealtimeWS:
     # silence episode instead of waiting for STALE_TIMEOUT to reconnect.
     # <= 0 or >= STALE_TIMEOUT disables the nudge.
     NUDGE_AFTER = 10.0
+    # EXPERIMENT: repeat the nudge every NUDGE_INTERVAL s, at most NUDGE_MAX
+    # per silence episode (nudge k at NUDGE_AFTER + (k-1) * NUDGE_INTERVAL).
+    NUDGE_INTERVAL = 10.0
+    NUDGE_MAX = 5
+    # EXPERIMENT: True = connect without aiohttp's 20 s heartbeat (no PING
+    # frames from us); the portal sends none.  Flip by editing this line.
+    EXPERIMENT_NO_HEARTBEAT = False
 
     def __init__(
         self,
@@ -352,7 +371,7 @@ class FoxESSRealtimeWS:
         # abnormal closure).
         self._recv_task: asyncio.Future[aiohttp.WSMessage] | None = None
         self._last_raw: float = asyncio.get_event_loop().time()
-        self._nudged = False
+        self._nudges = 0
         # A divergent frame that has NOT yet been corroborated.  When a
         # frame diverges >10x from ``_last_accepted`` we cannot yet tell a
         # genuine regime change (idle→charge, charge→idle, discharge start)
@@ -410,15 +429,23 @@ class FoxESSRealtimeWS:
             f"{self.WS_URL}?plantId={self._plant_id}"
             f"&token={encoded_token}&platform=web&lang=en"
         )
+        heartbeat = None if self.EXPERIMENT_NO_HEARTBEAT else 20.0
+        _LOGGER.info(
+            "FoxESS WebSocket EXPERIMENT connect: url=%s heartbeat=%s",
+            _mask(url),
+            heartbeat,
+        )
         self._ws = await self._http_session.ws_connect(
             url,
-            heartbeat=20.0,
+            heartbeat=heartbeat,
             timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
         )
+        self._log_handshake(self._ws)
+        self._instrument_ws(self._ws)
         await self._ws.send_str("getdata")
         await self._drop_recv()
         self._last_raw = asyncio.get_event_loop().time()
-        self._nudged = False
+        self._nudges = 0
         self._last_accepted = None
         self._pending = None
         self._connected = True
@@ -502,14 +529,52 @@ class FoxESSRealtimeWS:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
+    def _log_handshake(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """EXPERIMENT: log the request headers we sent (names, masked values)."""
+        try:
+            headers = ws._response.request_info.headers  # noqa: SLF001
+            _LOGGER.info(
+                "FoxESS WebSocket EXPERIMENT handshake request headers: %s",
+                {k: _mask(str(v)) for k, v in headers.items()},
+            )
+        except Exception:
+            _LOGGER.info("FoxESS WebSocket EXPERIMENT: handshake headers unavailable")
+
+    def _instrument_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """EXPERIMENT: log every frame this client sends on *ws*.
+
+        Wraps the socket's frame writer, so it also sees aiohttp's own
+        heartbeat PING and the PONG replies, not just our text messages.
+        """
+        try:
+            writer = ws._writer  # noqa: SLF001
+            send_frame = writer.send_frame
+        except Exception:
+            _LOGGER.info("FoxESS WebSocket EXPERIMENT: cannot log sent frames")
+            return
+
+        async def logged(message: bytes, opcode: int, *args: Any, **kwargs: Any) -> Any:
+            try:
+                kind = aiohttp.WSMsgType(opcode).name
+            except ValueError:
+                kind = str(opcode)
+            if opcode == aiohttp.WSMsgType.TEXT:
+                what = repr(_mask(bytes(message).decode("utf-8", "replace"))[:200])
+            else:
+                what = f"{len(message)} bytes"
+            _LOGGER.info("FoxESS WebSocket client sends %s: %s", kind, what)
+            return await send_frame(message, opcode, *args, **kwargs)
+
+        writer.send_frame = logged
+
     async def _receive(self) -> aiohttp.WSMessage:
-        """Return the next raw message; nudge once on silence.
+        """Return the next raw message; nudge repeatedly on silence.
 
         Raises ``TimeoutError`` after ``STALE_TIMEOUT`` seconds without any
-        raw frame, like ``wait_for(receive(), STALE_TIMEOUT)`` did, and
-        re-raises whatever ``receive()`` raises.  After ``NUDGE_AFTER``
-        seconds of silence, ``getdata`` is sent once on the same socket (one
-        nudge per silence episode; any frame re-arms it).  A failed send
+        raw frame and re-raises whatever ``receive()`` raises.  EXPERIMENT:
+        ``getdata`` is sent at ``NUDGE_AFTER`` seconds of silence and then
+        every ``NUDGE_INTERVAL`` seconds, up to ``NUDGE_MAX`` times per
+        silence episode; any frame ends the episode.  A failed send
         propagates, which the caller treats as a dead socket.
         """
         loop = asyncio.get_event_loop()
@@ -521,21 +586,39 @@ class FoxESSRealtimeWS:
         nudging = 0 < self.NUDGE_AFTER < self.STALE_TIMEOUT
         try:
             while True:
-                nudge_due = nudging and not self._nudged
-                wait_for = self.NUDGE_AFTER if nudge_due else self.STALE_TIMEOUT
-                remaining = self._last_raw + wait_for - loop.time()
-                done, _ = await asyncio.wait({task}, timeout=max(0.0, remaining))
+                stale_at = self._last_raw + self.STALE_TIMEOUT
+                due = None
+                if nudging and self._nudges < self.NUDGE_MAX:
+                    due = (
+                        self._last_raw
+                        + self.NUDGE_AFTER
+                        + self._nudges * self.NUDGE_INTERVAL
+                    )
+                deadline = stale_at if due is None else min(due, stale_at)
+                done, _ = await asyncio.wait(
+                    {task}, timeout=max(0.0, deadline - loop.time())
+                )
                 if done:
+                    now = loop.time()
+                    if self._nudges:
+                        _LOGGER.info(
+                            "FoxESS WebSocket: stream resumed %.1f s after "
+                            "last frame (nudges sent: %d)",
+                            now - self._last_raw,
+                            self._nudges,
+                        )
                     self._recv_task = None
-                    self._last_raw = loop.time()
-                    self._nudged = False
+                    self._last_raw = now
+                    self._nudges = 0
                     return task.result()
-                if not nudge_due:
+                if due is None or due >= stale_at:
                     await self._drop_recv()
                     raise TimeoutError
-                self._nudged = True
+                self._nudges += 1
                 _LOGGER.info(
-                    "FoxESS WebSocket: no frame in %.0fs, re-sent getdata",
+                    "FoxESS WebSocket: nudge %d sent at %.1f s of silence "
+                    "(re-sent getdata)",
+                    self._nudges,
                     loop.time() - self._last_raw,
                 )
                 try:
