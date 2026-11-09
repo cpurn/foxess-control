@@ -511,7 +511,11 @@ async def _ws_push_loop(app: web.Application) -> None:
     try:
         loop = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(model.ws_push_interval_s)
+            # Sleep in slices so a shortened interval (tests) takes effect
+            # at once instead of after the previous, possibly 5 s, sleep.
+            slept_from = loop.time()
+            while (left := model.ws_push_interval_s - (loop.time() - slept_from)) > 0:
+                await asyncio.sleep(min(left, 0.05))
             if not ws_clients or model.active_fault == "ws_disconnect":
                 continue
             msg = json.dumps(model.get_ws_message())
