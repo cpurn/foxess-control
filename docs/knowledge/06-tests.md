@@ -191,6 +191,8 @@ charge/discharge scenarios through containerised HA + simulator
 | `TestStaleness::test_stale_messages_skipped` | timeDiff > 30 filtered | C-005 |
 | `TestIsPlausible::*` (11 tests) | >10x divergence filter | C-004 |
 | `TestWsPlausibilityFilter::*` (3 tests) | Plausibility in WS listen loop | C-004 |
+| `TestGetdataNudge::*` (10 tests) | getdata nudge on raw-frame silence: restores a cut stream, one per episode, none while frames flow, ignored nudge and failed send fall back to reconnect, dropped frames vs 120 s rule | C-005 |
+| `test_getdata_nudge_against_the_simulator` | Real sockets, simulator stream cutoff + resume on getdata | C-005 |
 | `TestPlausibilityLockup::*` (10 tests) | Settled level after a spike, EV start/stop, lone glitch still dropped, reconnect after 120 s of only dropped frames | C-004, C-005 |
 
 ## Coordinator & Data Injection

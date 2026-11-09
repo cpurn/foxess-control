@@ -208,6 +208,15 @@ class InverterModel:
     # WS config overrides
     ws_unit: str = "W"  # "W" or "kW"
     ws_time_diff: int = 5  # normal
+    ws_push_interval_s: float = 5.0  # seconds between pushed WS frames
+    # > 0: the stream of each client stops (silently, socket stays open) this
+    # many seconds after the getdata that started it, like the real cloud
+    # (~300 s).  A getdata sent after the stop restarts it when
+    # ``ws_resume_on_getdata``; one sent while frames still flow does not
+    # extend it.  0 = never stops.
+    ws_stream_cutoff_s: float = 0.0
+    ws_resume_on_getdata: bool = True
+    ws_getdata_count: int = 0  # getdata messages received (all clients)
 
     # Autonomous rate limiting (per-endpoint, seconds between requests)
     # Default 0 = disabled, so existing tests are unaffected.
@@ -876,6 +885,10 @@ class InverterModel:
             "api_key": self.api_key,
             "ws_unit": self.ws_unit,
             "ws_time_diff": self.ws_time_diff,
+            "ws_push_interval_s": self.ws_push_interval_s,
+            "ws_stream_cutoff_s": self.ws_stream_cutoff_s,
+            "ws_resume_on_getdata": self.ws_resume_on_getdata,
+            "ws_getdata_count": self.ws_getdata_count,
             "feedin_total_kwh": round(self.feedin_total_kwh, 3),
             "grid_consumption_total_kwh": round(self.grid_consumption_total_kwh, 3),
             "generation_total_kwh": round(self.generation_total_kwh, 3),

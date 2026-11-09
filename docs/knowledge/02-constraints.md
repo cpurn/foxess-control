@@ -284,8 +284,9 @@ seconds stale (cached cloud data).
 to briefly show incorrect or missing values on the overview card.
 **Violation consequence**: Dashboard shows "—" or wrong values for
 grid/battery/solar power immediately after WS connects.
-**Traces**: D-008;
-`tests/test_realtime_ws.py::TestStaleness::test_stale_messages_skipped`
+**Traces**: D-008, D-064;
+`tests/test_realtime_ws.py::TestStaleness::test_stale_messages_skipped`,
+`tests/test_realtime_ws.py::TestGetdataNudge`
 
 ### C-006: Grid direction never depends on the power balance matching
 **Priority enforced**: P-005 (operational transparency) — wrong grid
