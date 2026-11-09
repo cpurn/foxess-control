@@ -290,6 +290,13 @@ class FoxESSRealtimeWS:
     # filter for this long: the reference is stuck, treat it as a dead
     # stream and reconnect (which resets ``_last_accepted``/``_pending``).
     DROPPED_FRAMES_RECONNECT_AFTER = 120.0
+    # The cloud stops pushing about 300 s after the last ``getdata`` while
+    # the socket stays open; a ``getdata`` sent AFTER the push has stopped
+    # restarts it on the same socket (what the web portal does).  After
+    # this many seconds without any raw frame send one ``getdata`` per
+    # silence episode instead of waiting for STALE_TIMEOUT to reconnect.
+    # <= 0 or >= STALE_TIMEOUT disables the nudge.
+    NUDGE_AFTER = 10.0
 
     def __init__(
         self,
@@ -339,6 +346,13 @@ class FoxESSRealtimeWS:
         self._last_useful_data: float = asyncio.get_event_loop().time()
         self._last_accepted: dict[str, Any] | None = None
         self._grid_direction = GridDirectionTracker()
+        # Raw-frame silence tracking for the getdata nudge.  The pending
+        # ``receive()`` is kept across nudge wake-ups instead of being
+        # cancelled and restarted (aiohttp marks a cancelled receive as an
+        # abnormal closure).
+        self._recv_task: asyncio.Future[aiohttp.WSMessage] | None = None
+        self._last_raw: float = asyncio.get_event_loop().time()
+        self._nudged = False
         # A divergent frame that has NOT yet been corroborated.  When a
         # frame diverges >10x from ``_last_accepted`` we cannot yet tell a
         # genuine regime change (idle→charge, charge→idle, discharge start)
@@ -402,6 +416,9 @@ class FoxESSRealtimeWS:
             timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
         )
         await self._ws.send_str("getdata")
+        await self._drop_recv()
+        self._last_raw = asyncio.get_event_loop().time()
+        self._nudged = False
         self._last_accepted = None
         self._pending = None
         self._connected = True
@@ -477,14 +494,68 @@ class FoxESSRealtimeWS:
         self._pending = mapped
         return None
 
+    async def _drop_recv(self) -> None:
+        """Cancel the pending ``receive()`` of the previous socket, if any."""
+        task, self._recv_task = self._recv_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _receive(self) -> aiohttp.WSMessage:
+        """Return the next raw message; nudge once on silence.
+
+        Raises ``TimeoutError`` after ``STALE_TIMEOUT`` seconds without any
+        raw frame, like ``wait_for(receive(), STALE_TIMEOUT)`` did, and
+        re-raises whatever ``receive()`` raises.  After ``NUDGE_AFTER``
+        seconds of silence, ``getdata`` is sent once on the same socket (one
+        nudge per silence episode; any frame re-arms it).  A failed send
+        propagates, which the caller treats as a dead socket.
+        """
+        loop = asyncio.get_event_loop()
+        if self._recv_task is None:
+            self._recv_task = asyncio.ensure_future(
+                self._ws.receive()  # type: ignore[union-attr]
+            )
+        task = self._recv_task
+        nudging = 0 < self.NUDGE_AFTER < self.STALE_TIMEOUT
+        try:
+            while True:
+                nudge_due = nudging and not self._nudged
+                wait_for = self.NUDGE_AFTER if nudge_due else self.STALE_TIMEOUT
+                remaining = self._last_raw + wait_for - loop.time()
+                done, _ = await asyncio.wait({task}, timeout=max(0.0, remaining))
+                if done:
+                    self._recv_task = None
+                    self._last_raw = loop.time()
+                    self._nudged = False
+                    return task.result()
+                if not nudge_due:
+                    await self._drop_recv()
+                    raise TimeoutError
+                self._nudged = True
+                _LOGGER.info(
+                    "FoxESS WebSocket: no frame in %.0fs, re-sent getdata",
+                    loop.time() - self._last_raw,
+                )
+                try:
+                    await self._ws.send_str("getdata")  # type: ignore[union-attr]
+                except Exception:
+                    _LOGGER.warning(
+                        "FoxESS WebSocket: getdata nudge failed, reconnecting",
+                        exc_info=True,
+                    )
+                    await self._drop_recv()
+                    raise
+        except asyncio.CancelledError:
+            await self._drop_recv()
+            raise
+
     async def _listen_loop(self) -> None:
         """Receive messages, reconnect on failure."""
         while not self._stop_event.is_set():
             try:
-                msg = await asyncio.wait_for(
-                    self._ws.receive(),  # type: ignore[union-attr]
-                    timeout=self.STALE_TIMEOUT,
-                )
+                msg = await self._receive()
             except TimeoutError:
                 _LOGGER.warning(
                     "FoxESS WebSocket stale (no data in %.0fs)",
@@ -672,6 +743,7 @@ class FoxESSRealtimeWS:
 
     async def _close_ws(self) -> None:
         """Close the WebSocket connection if open."""
+        await self._drop_recv()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
         self._ws = None

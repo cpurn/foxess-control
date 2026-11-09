@@ -324,7 +324,9 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 if msg.data == "getdata":
-                    await ws.send_json(model.get_ws_message())
+                    model.ws_getdata_count += 1
+                    if _getdata_accepted(model, ws):
+                        await ws.send_json(model.get_ws_message())
             elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
                 break
     finally:
@@ -333,6 +335,32 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         _LOGGER.info("WebSocket disconnected (clients=%d)", len(ws_clients))
 
     return ws
+
+
+def _stream_live(model: InverterModel, ws: web.WebSocketResponse) -> bool:
+    """Whether *ws* is still inside its pushed-stream window."""
+    if model.ws_stream_cutoff_s <= 0:
+        return True
+    until = ws.get("stream_until")
+    return until is not None and time.monotonic() < until
+
+
+def _getdata_accepted(model: InverterModel, ws: web.WebSocketResponse) -> bool:
+    """Apply the cloud's getdata rules; True if a reply should be sent.
+
+    Without a cutoff every getdata is answered.  With one, the first getdata
+    starts the stream window; a getdata while it is live is answered but does
+    not extend it; one after it ended restarts it unless the model is told to
+    ignore it.
+    """
+    if model.ws_stream_cutoff_s <= 0:
+        return True
+    if _stream_live(model, ws):
+        return True
+    if "stream_until" in ws and not model.ws_resume_on_getdata:
+        return False
+    ws["stream_until"] = time.monotonic() + model.ws_stream_cutoff_s
+    return True
 
 
 async def _auto_tick_loop(app: web.Application) -> None:
@@ -359,13 +387,13 @@ async def _ws_push_loop(app: web.Application) -> None:
     ws_clients: list[web.WebSocketResponse] = app["ws_clients"]
     try:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(model.ws_push_interval_s)
             if not ws_clients or model.active_fault == "ws_disconnect":
                 continue
             msg = json.dumps(model.get_ws_message())
             stale_msg = json.dumps({"errno": 0, "result": {"timeDiff": 999}})
             for i, ws in enumerate(list(ws_clients)):
-                if ws.closed:
+                if ws.closed or not _stream_live(model, ws):
                     continue
                 try:
                     if i == len(ws_clients) - 1:

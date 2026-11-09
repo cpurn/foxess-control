@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,8 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from .conftest import SimulatorHandle
 
 from custom_components.foxess_control.foxess.realtime_ws import (
     FoxESSRealtimeWS,
@@ -1369,3 +1372,311 @@ class TestPlausibilityLockup:
         await ws._do_connect("tok")
         assert ws._last_accepted is None
         assert ws._pending is None
+
+
+# ---------------------------------------------------------------------------
+# getdata nudge: restart a stream the cloud stopped, on the same socket
+# ---------------------------------------------------------------------------
+
+
+async def _until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Poll *predicate* every few ms; fail if it is not true within *timeout*."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, "condition not reached in time"
+        await asyncio.sleep(0.005)
+
+
+class _NudgeSocket:
+    """Fake FoxESS socket that follows the measured cloud behaviour.
+
+    The first ``getdata`` starts a stream: one frame every *interval* seconds
+    for *stream_s* seconds.  Then the cloud goes silent while the socket stays
+    open.  A ``getdata`` sent after that restarts the stream (when *resume*);
+    one sent while frames still flow does not extend it.
+    """
+
+    closed = False
+
+    def __init__(
+        self,
+        *,
+        interval: float = 0.02,
+        stream_s: float = 0.3,
+        resume: bool = True,
+        frame_w: Callable[[int], float] = lambda n: 500.0,
+    ) -> None:
+        self.interval = interval
+        self.stream_s = stream_s
+        self.resume = resume
+        self.frame_w = frame_w
+        self.queue: asyncio.Queue[aiohttp.WSMessage] = asyncio.Queue()
+        self.getdata_episodes: list[int] = []  # silent-episode index per getdata
+        self.cuts = 0
+        self.fail_sends = False
+        self.frames_sent = 0
+        self._until = 0.0
+        self._pump: asyncio.Task[None] | None = None
+
+    @property
+    def getdata(self) -> int:
+        return len(self.getdata_episodes)
+
+    def _live(self) -> bool:
+        return asyncio.get_event_loop().time() < self._until
+
+    async def send_str(self, data: str) -> None:
+        assert data == "getdata"
+        if self.fail_sends and self.getdata >= 1:
+            raise ConnectionResetError("socket is closing")
+        self.getdata_episodes.append(self.cuts)
+        if self._live():
+            return
+        if self.getdata > 1 and not self.resume:
+            return
+        self._until = asyncio.get_event_loop().time() + self.stream_s
+        self._pump = asyncio.ensure_future(self._run_pump())
+
+    async def _run_pump(self) -> None:
+        while self._live():
+            self.queue.put_nowait(_load_frame(self.frame_w(self.frames_sent)))
+            self.frames_sent += 1
+            await asyncio.sleep(self.interval)
+        self.cuts += 1
+
+    async def receive(self) -> aiohttp.WSMessage:
+        return await self.queue.get()
+
+    async def close(self) -> None:
+        self.closed = True
+        if self._pump is not None:
+            self._pump.cancel()
+
+
+class _NudgeHarness:
+    """A listen loop on a ``_NudgeSocket`` with scaled-down timeouts."""
+
+    def __init__(
+        self,
+        sock: _NudgeSocket,
+        *,
+        nudge_after: float = 0.1,
+        stale: float = 0.4,
+        dropped_after: float | None = None,
+    ) -> None:
+        self.sock = sock
+        self.loop = asyncio.get_event_loop()
+        self.frame_times: list[float] = []
+        self.reconnect_times: list[float] = []
+        self.on_disconnect = MagicMock()
+
+        async def on_data(mapped: dict[str, Any]) -> None:
+            self.frame_times.append(self.loop.time())
+
+        web_session = AsyncMock()
+        web_session.async_ensure_token = AsyncMock(return_value="tok")
+        self.ws = FoxESSRealtimeWS("plant1", web_session, on_data, self.on_disconnect)
+        self.ws.NUDGE_AFTER = nudge_after
+        self.ws.STALE_TIMEOUT = stale
+        if dropped_after is not None:
+            self.ws.DROPPED_FRAMES_RECONNECT_AFTER = dropped_after
+
+        async def fake_reconnect() -> None:
+            self.reconnect_times.append(self.loop.time())
+            self.ws._connected = False  # ends the loop
+
+        self.ws._try_reconnect = fake_reconnect  # type: ignore[method-assign]
+        self.ws._ws = sock  # type: ignore[assignment]
+
+    async def start(self) -> None:
+        await self.sock.send_str("getdata")  # what _do_connect does
+        self.ws._last_raw = self.loop.time()
+        self.ws._connected = True
+        self.ws._stop_event.clear()
+        self.ws._listen_task = asyncio.ensure_future(self.ws._listen_loop())
+
+    async def stop(self) -> None:
+        self.disconnects_before_stop = self.on_disconnect.call_count
+        await self.ws.async_disconnect()
+
+
+@pytest.mark.asyncio
+class TestGetdataNudge:
+    """After NUDGE_AFTER s of raw-frame silence one ``getdata`` goes out on the
+    same socket; the stale timeout stays the safety net."""
+
+    async def test_defaults(self) -> None:
+        assert FoxESSRealtimeWS.NUDGE_AFTER == 10.0
+        assert FoxESSRealtimeWS.NUDGE_AFTER < FoxESSRealtimeWS.STALE_TIMEOUT
+
+    async def test_nudge_restores_a_cut_stream(self) -> None:
+        h = _NudgeHarness(_NudgeSocket())
+        await h.start()
+        try:
+            await _until(lambda: h.sock.cuts >= 1)
+            at_cut = len(h.frame_times)
+            await _until(lambda: len(h.frame_times) > at_cut)
+        finally:
+            await h.stop()
+        assert h.sock.getdata == 2  # connect + exactly one nudge
+        assert h.reconnect_times == []
+        assert h.disconnects_before_stop == 0
+
+    async def test_nudge_is_logged_at_info(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        h = _NudgeHarness(_NudgeSocket())
+        with caplog.at_level("INFO"):
+            await h.start()
+            try:
+                await _until(lambda: h.sock.getdata >= 2)
+            finally:
+                await h.stop()
+        nudges = [r for r in caplog.records if "re-sent getdata" in r.getMessage()]
+        assert len(nudges) == 1
+        assert nudges[0].levelname == "INFO"
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    async def test_ignored_nudge_falls_back_to_the_stale_reconnect(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        h = _NudgeHarness(_NudgeSocket(resume=False), stale=0.4)
+        with caplog.at_level("INFO"):
+            await h.start()
+            await _until(lambda: bool(h.reconnect_times))
+        await h.stop()
+        assert h.sock.getdata == 2  # connect + one nudge, no more
+        last_frame = h.frame_times[-1]
+        gap = h.reconnect_times[0] - last_frame
+        assert 0.35 <= gap < 0.75, f"reconnect {gap:.2f}s after the last frame"
+        stale = [r for r in caplog.records if "stale (no data in" in r.getMessage()]
+        assert len(stale) == 1
+        assert stale[0].levelname == "WARNING"
+
+    async def test_continuous_frames_never_nudge(self) -> None:
+        h = _NudgeHarness(_NudgeSocket(stream_s=30.0))
+        await h.start()
+        try:
+            await _until(lambda: len(h.frame_times) >= 30)  # > 5 x NUDGE_AFTER
+        finally:
+            await h.stop()
+        assert h.sock.getdata == 1
+        assert h.reconnect_times == []
+
+    async def test_one_nudge_per_silence_episode(self) -> None:
+        h = _NudgeHarness(_NudgeSocket(stream_s=0.2))
+        await h.start()
+        try:
+            await _until(lambda: h.sock.cuts >= 4)
+            at_cut = len(h.frame_times)
+            await _until(lambda: len(h.frame_times) > at_cut)
+        finally:
+            await h.stop()
+        nudge_episodes = h.sock.getdata_episodes[1:]
+        assert len(nudge_episodes) >= 4
+        assert len(set(nudge_episodes)) == len(nudge_episodes), nudge_episodes
+        assert h.reconnect_times == []
+        assert h.disconnects_before_stop == 0
+
+    async def test_failed_send_takes_the_reconnect_path(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sock = _NudgeSocket(stream_s=0.15)
+        sock.fail_sends = True
+        h = _NudgeHarness(sock, stale=0.6)
+        with caplog.at_level("INFO"):
+            await h.start()
+            await _until(lambda: bool(h.reconnect_times))
+        await h.stop()
+        gap = h.reconnect_times[0] - h.frame_times[-1]
+        assert gap < 0.45, f"waited {gap:.2f}s, i.e. for the stale timeout"
+        assert [r for r in caplog.records if "nudge failed" in r.getMessage()]
+
+    async def test_dropped_frames_count_as_raw_but_not_as_accepted(self) -> None:
+        # One accepted frame, then levels that each diverge from the reference
+        # and from each other, so nothing is accepted again.
+        def frames(n: int) -> float:
+            return 3000.0 if n == 0 else (200.0, 40000.0)[n % 2]
+
+        h = _NudgeHarness(
+            _NudgeSocket(stream_s=30.0, frame_w=frames), dropped_after=0.3
+        )
+        await h.start()
+        await _until(lambda: bool(h.reconnect_times))
+        await h.stop()
+        assert h.sock.getdata == 1, "dropped frames are frames: no nudge"
+        assert len(h.frame_times) == 1
+        # The 120 s rule (scaled) still fires from the last ACCEPTED frame.
+        assert h.reconnect_times[0] - h.frame_times[0] >= 0.3
+
+    async def test_disabled_when_zero(self) -> None:
+        h = _NudgeHarness(_NudgeSocket(resume=False), nudge_after=0.0)
+        await h.start()
+        await _until(lambda: bool(h.reconnect_times))
+        await h.stop()
+        assert h.sock.getdata == 1
+
+    async def test_disconnect_leaves_no_pending_receive(self) -> None:
+        h = _NudgeHarness(_NudgeSocket(stream_s=30.0))
+        await h.start()
+        await _until(lambda: len(h.frame_times) >= 3)
+        await h.stop()
+        assert h.ws._recv_task is None
+        assert h.ws._listen_task is None
+
+
+@pytest.mark.asyncio
+async def test_getdata_nudge_against_the_simulator(
+    foxess_sim: SimulatorHandle,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real aiohttp sockets: the simulator cuts the stream and resumes on getdata."""
+    foxess_sim.set(
+        fuzzing=False, ws_push_interval_s=0.05, ws_stream_cutoff_s=0.8, soc=65
+    )
+    loop = asyncio.get_event_loop()
+    times: list[float] = []
+
+    async def on_data(mapped: dict[str, object]) -> None:
+        times.append(loop.time())
+
+    on_disconnect = MagicMock()
+    web_session = AsyncMock()
+    web_session.async_ensure_token = AsyncMock(return_value="tok")
+    ws = FoxESSRealtimeWS(
+        "plant1",
+        web_session,
+        on_data,
+        on_disconnect,
+        ws_url=foxess_sim.url.replace("http://", "ws://") + "/dew/v0/wsmaitian",
+    )
+    ws.NUDGE_AFTER = 0.3
+    ws.STALE_TIMEOUT = 1.5
+    reconnects = 0
+    original = ws._try_reconnect
+
+    async def counting() -> None:
+        nonlocal reconnects
+        reconnects += 1
+        await original()
+
+    ws._try_reconnect = counting  # type: ignore[method-assign]
+
+    def nudges() -> int:
+        return sum("re-sent getdata" in r.getMessage() for r in caplog.records)
+
+    try:
+        with caplog.at_level("INFO"):
+            await ws.async_connect()
+            await _until(lambda: nudges() >= 3, timeout=30.0)
+            await _until(lambda: bool(times) and loop.time() - times[-1] < 0.25)
+    finally:
+        disconnects_before_stop = on_disconnect.call_count
+        await ws.async_disconnect()
+    assert disconnects_before_stop == 0
+    assert reconnects == 0
+    # The server saw the connect getdata plus every nudge.  The backchannel
+    # is a blocking HTTP call, so ask only once, after the socket is closed.
+    seen = (await asyncio.to_thread(foxess_sim.state))["ws_getdata_count"]
+    assert seen >= 3  # the last nudge may still be in flight at close

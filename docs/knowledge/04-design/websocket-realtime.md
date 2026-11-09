@@ -452,6 +452,54 @@ never learns that `pvPower` may include an external term.
 **Traces**: C-035, C-021, C-039, C-020, C-026; D-010 (grid-direction
 balance the external term improves).
 
+### D-064: Re-send getdata after the stream stops, instead of reconnecting
+**Decision**: `FoxESSRealtimeWS` measures silence from the last *raw* frame
+(any message returned by `receive()`, including stale-`timeDiff` and
+plausibility-dropped frames). After `NUDGE_AFTER` (10 s) with none it sends
+`getdata` once on the existing socket and logs INFO "no frame in Ns,
+re-sent getdata"; one nudge per silence episode, re-armed by any frame. It
+never sends `getdata` while frames are flowing. `STALE_TIMEOUT` (30 s,
+C-005) is unchanged and measured from the same last raw frame: if the nudge
+brings nothing back the existing WARNING and `_try_reconnect` run exactly as
+before. A failing `send_str` is logged at WARNING and takes the same
+reconnect path. `NUDGE_AFTER <= 0` or `>= STALE_TIMEOUT` disables it. The
+pending `receive()` is kept across the nudge wake-up (not cancelled and
+restarted) and cancelled when the socket is replaced or closed. The
+`DROPPED_FRAMES_RECONNECT_AFTER` rule still runs from the last *accepted*
+frame, so dropped frames count as raw frames for the nudge but not for it.
+**Context**: Measured 2026-11-09 by watching the portal's live dashboard:
+frames arrive about every 5 s for ~300 s after the last `getdata`, then the
+cloud stops pushing and the socket stays open. About 30 s later the portal
+sends `getdata` again on the same socket and frames resume within ~1 s at the
+same cadence; it sends nothing else (no ping, no other keep-alive). Our
+earlier ws_mode `always` behaviour reconnected after 30 s of silence, so
+`data_source` flipped `ws -> api -> ws` and data froze ~40 s every ~5 min
+35 s.
+**Rationale**: Only a `getdata` sent *after* the push has stopped restarts
+it. That is why re-sending every 60 s while frames were flowing (tried live
+2026-10-29) did not extend the stream, and why a one-shot nudge on silence
+does. It is cheaper and less disruptive than any reconnect: no new socket,
+no token use, no `on_disconnect`, no `api` fallback. The nudge fires at 10 s,
+inside the 30 s window, so a working nudge costs ~10 s of silence at most
+instead of ~40 s of frozen data. This refines the premise of D-062 (limit is
+on the connection) - the cut is on the push subscription and a `getdata`
+revives it - without contradicting its handover design.
+**Priority served**: P-005 (Operational transparency)
+**Trades against**: none
+**Classification**: other
+**Alternatives considered**:
+- Periodic `getdata` while frames flow: tried live, does not extend the
+  stream.
+- Reconnect earlier or proactively: still an `on_disconnect` and a socket
+  swap; see D-062.
+- Shorten `STALE_TIMEOUT`: only shrinks the gap, and ~5 s frame jitter
+  leaves little margin.
+- Keep waiting for the cloud to resume by itself: the portal shows it does
+  not.
+**Traces**: C-005;
+`tests/test_realtime_ws.py::TestGetdataNudge` (10 tests),
+`tests/test_realtime_ws.py::test_getdata_nudge_against_the_simulator`
+
 ## Key Behaviours
 
 - WebSocket requires web portal credentials (username + MD5(password)),
