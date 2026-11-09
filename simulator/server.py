@@ -454,6 +454,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     # if the server doesn't respond, aiohttp may close the connection.
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+    ws["connected_at"] = asyncio.get_running_loop().time()
     ws_clients.append(ws)
     _LOGGER.info(
         "WebSocket connected (clients=%d, active=newest only)",
@@ -464,7 +465,13 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 if msg.data == "getdata":
-                    await ws.send_json(model.get_ws_message())
+                    reply = model.get_ws_message()
+                    cutoff = model.ws_stream_cutoff_s
+                    age = asyncio.get_running_loop().time() - ws["connected_at"]
+                    if cutoff > 0 and age >= cutoff:
+                        # past the cut the cloud answers with a cached frame
+                        reply["result"]["timeDiff"] = model.ws_cached_time_diff
+                    await ws.send_json(reply)
             elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
                 break
     finally:
@@ -494,19 +501,31 @@ async def _ws_push_loop(app: web.Application) -> None:
     the client's receive() from timing out but carry no useful data.
     This replicates FoxESS cloud behaviour where a new web/app login
     takes over the stream but the old connection stays alive.
+
+    With ``model.ws_stream_cutoff_s`` > 0 every client additionally goes
+    completely silent that many seconds after it connected (socket open,
+    no frames - what the real cloud does ~300 s after each connect).
     """
     model: InverterModel = app["model"]
     ws_clients: list[web.WebSocketResponse] = app["ws_clients"]
     try:
+        loop = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(5)
+            # Sleep in slices so a shortened interval (tests) takes effect
+            # at once instead of after the previous, possibly 5 s, sleep.
+            slept_from = loop.time()
+            while (left := model.ws_push_interval_s - (loop.time() - slept_from)) > 0:
+                await asyncio.sleep(min(left, 0.05))
             if not ws_clients or model.active_fault == "ws_disconnect":
                 continue
             msg = json.dumps(model.get_ws_message())
             stale_msg = json.dumps({"errno": 0, "result": {"timeDiff": 999}})
+            cutoff = model.ws_stream_cutoff_s
             for i, ws in enumerate(list(ws_clients)):
                 if ws.closed:
                     continue
+                if cutoff > 0 and loop.time() - ws.get("connected_at", 0.0) >= cutoff:
+                    continue  # stream ended for this connection
                 try:
                     if i == len(ws_clients) - 1:
                         await ws.send_str(msg)

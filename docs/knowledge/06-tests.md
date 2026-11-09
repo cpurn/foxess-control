@@ -189,6 +189,10 @@ charge/discharge scenarios through containerised HA + simulator
 | `TestGridDirectionEvCharger::*` | Live 2026-10-27 EV samples: charger node, signed `gridToHidden`, 48x divergence, export sample | C-006 |
 | `TestGridDirectionTracker::*` | Variable 4-8 kW unmeasured load, ~3x ratio, hold, learned gridStatus, GH #3 | C-006 |
 | `TestStaleness::test_stale_messages_skipped` | timeDiff > 30 filtered | C-005 |
+| `TestOverlapReconnect::*` (19 tests) | Proactive handover (fake sockets): fires at the interval and not before, seamless swap (no `on_disconnect`, no WARNING, no lost frame), old socket quiet/stale/closed during handover is not an error, silent, cached-stale, implausible-until-corroborated or unreachable new socket does not swap (old kept, retried / normal stale path), `async_disconnect`/`request_stop`/`_stop_event` leave no tasks or sockets, tracker, anchor and pending survive the swap, 120 s dropped-frames rule still fires | C-005, C-020 |
+| `TestStreamCutAtFixedAge::*` (2 tests) | Stream cut at a fixed age: no data gap with overlap reconnect; baseline without it shows the old 30 s gap | C-005, C-020 |
+| `test_overlap_reconnect_against_the_simulator` | Real sockets against the simulator's `ws_stream_cutoff_s` mode, newest-client-wins | C-005, C-020 |
+| `test_getdata_after_the_cut_only_returns_a_cached_frame` | Simulator past the cut answers getdata with one cached stale frame (discarded); stale-timeout reconnect restores live data | C-005 |
 | `TestIsPlausible::*` (11 tests) | >10x divergence filter | C-004 |
 | `TestWsPlausibilityFilter::*` (3 tests) | Plausibility in WS listen loop | C-004 |
 | `TestPlausibilityLockup::*` (10 tests) | Settled level after a spike, EV start/stop, lone glitch still dropped, reconnect after 120 s of only dropped frames | C-004, C-005 |
